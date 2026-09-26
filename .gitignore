@@ -1,0 +1,33 @@
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.venv-colbert/
+.uv/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+
+# data & checkpoints
+data/
+checkpoints/
+*.bin
+*.pt
+*.safetensors
+wandb/
+
+# evaluation outputs
+*.json
+eval_results/
+mteb_results/
+mteb_results_colbert/
+mteb_cache*/
+glue_search_work/
+benchmark.png
+benchmark_*.png
+ppl_benchmark*.png
+
+# os
+.DS_Store

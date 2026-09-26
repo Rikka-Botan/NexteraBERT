@@ -1,0 +1,70 @@
+# Phase 1: Initial BERT MLM pretraining (1024 tokens), 120 B tokens (the released
+# 130 B-token model; the 13 B / 1.3 B models set train_tokens to 12.0e+9 / 1.2e+9).
+# Bulk vocabulary and local-context learning; followed by a brief
+# 8192 long-context extension (configs/pretrain_bert_phase2.yaml).
+# Standard masked language modeling with 80/10/10 masking (no discriminator).
+# OptiBERT-style recipe (ModernBERT BPE, FineWeb-Edu, one document per example (dynamic padding)).
+#
+# Data: drawn from the ~121 B FineWeb-Edu(90.25%)+DCLM(4.75%)+StarCoderData code(5%)
+# corpus (~120 B train slice), built once by scripts/build_data.sh to
+# data/mix_1024.bin (published as RikkaBotan/NexteraBERT-data-mix).
+
+# --- training mode ---
+training_mode: bert
+
+# --- data (FineWeb-Edu 90.25% + DCLM 4.75% + StarCoderData code 5%, ~99% train slice) ---
+dataset_name: HuggingFaceFW/fineweb-edu   # unused when 'pretokenized' is set (kept for schema)
+dataset_config: sample-350BT
+text_column: text
+tokenizer: answerdotai/ModernBERT-base
+max_seq_len: 1024
+pretokenized: data/mix_1024.bin
+eval_pretokenized: data/mix_eval_1024.bin  # disjoint held-out, same 90.25/4.75/5 distribution
+
+# --- model ---
+disc_size: mezzoforte
+mask_ratio: 0.30            # fallback (used only if the schedule below is disabled)
+# MLM mask-ratio schedule: ramp start -> end over the run.
+# ratio = start + (end-start) * (step/max_steps)**power.
+# start > end decreases; power=1.0 is linear (>1 gentle-then-steep, <1 steep-then-gentle).
+mask_ratio_start: 0.4
+mask_ratio_end: 0.2
+mask_ratio_power: 1.0       # linear
+router_z_loss_coef: 1.0e-3
+load_balance_loss_coef: 1.0e-3
+
+# --- optimisation ---
+# batch_size / grad_accum are PER GPU. The released models were trained on one GPU:
+# 128 x 8 = 1024 examples per optimizer step; on N GPUs divide grad_accum by N to
+# keep that batch. This is a varlen (one-document-per-example) shard, so a step's
+# real token count is 1024 x the shard's MEAN SEGMENT LENGTH (669 tokens), not
+# 1024 x 1024 — the collate's padding is masked out and carries no data.
+# train_tokens therefore derives max_steps from the shard's own statistics at
+# startup (~175k steps for 120 B tokens at 1024 examples/step).
+batch_size: 128
+grad_accum: 8
+lr: 8.0e-4
+weight_decay: 0.1    # OptiBERT: fixed 0.1 with standard AdamW (per-step decay lr*wd*p)
+beta1: 0.9
+beta2: 0.95          # OptiBERT/NeoBERT (LLaMA-2 value)
+train_tokens: 12.0e+10  # 120 B content tokens (13 B / 1.3 B models: 12.0e+9 / 1.2e+9)
+max_steps: 48000       # fallback only — train_tokens overrides it at startup.
+warmup_steps: 2000       # fallback
+warmup_frac: 0.10        # OptiBERT: warmup covers 10% of steps (clamped to [500, 50k]);
+                         # then cosine decay to 10% of peak LR over the rest
+grad_clip: 1.0
+dtype: bf16
+num_workers: 8
+compile: true
+
+# --- logging / io ---
+output_dir: checkpoints/mezzoforte_bert/phase1
+log_every: 100
+eval_every: 2000
+save_every: 10000
+eval_steps: 50
+seed: 1234
+
+# --- Weights & Biases ---
+wandb_project: nexterabert
+wandb_log_model: false

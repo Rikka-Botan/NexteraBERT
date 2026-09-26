@@ -1,0 +1,5 @@
+# Shell scripts must keep LF endings in the working tree. This checkout runs with
+# core.autocrlf=true, which otherwise converts them to CRLF and makes bash fail on
+# the first line it parses ("set: pipefail: invalid option name", the trailing \r
+# being read as part of the argument).
+*.sh text eol=lf
