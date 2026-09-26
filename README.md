@@ -88,8 +88,7 @@ that matches your driver from [pytorch.org](https://pytorch.org/get-started/loca
 | `dev` | ruff, and the optional fast tokenizer backend used by `scripts/prepare_data.py` |
 
 The speed and length benchmarks (`model_speedbench.py`, `model_pplbench.py`) also need
-matplotlib (`uv pip install matplotlib`). The ColBERT stage installs PyLate into its own
-environment (`.venv-colbert`), because PyLate pins its own sentence-transformers version.
+matplotlib (`uv pip install matplotlib`).
 
 ## Quick start
 
@@ -147,12 +146,6 @@ and the convolutions stop at row edges. This also removes a padding leak in HRA,
 convolutions otherwise read the pad slots after a row's last token, so a head fine-tuned
 on padded batches sees slightly different features; that is why unpadding is opt-in.
 Calls without an `attention_mask` keep the padded path.
-
-`scripts/verify_unpadding.py` checks exactness and speed on a Hub checkpoint. Measured
-on an RTX 5080 with NanoBEIR text: in fp32, the hidden states of unpadded batches
-differ from each text encoded alone by at most 4.0e-6 (padded batches: 1.7e-1); in
-bf16 with batches of 64, unpadded batches run 1.4–4.0× faster than padded ones in
-eager mode and 1.8–3.7× faster under `torch.compile`.
 
 ## Pretraining
 
@@ -221,8 +214,6 @@ see the top of the script). Metrics go to Weights & Biases: set `WANDB_API_KEY` 
 
 `NPROC` sets the number of GPUs for both pretraining and GLUE. With more than one GPU,
 lower `grad_accum` in the two configs as described above to keep the released recipe.
-The pipeline's MTEB stage trains the SimCSE stage without layer-wise LR decay; for
-numbers comparable to the paper, use `scripts/eval_mteb.sh` (below).
 
 ### Step by step
 
@@ -288,12 +279,9 @@ an interrupted run resumes; `FORCE=1` reruns it. Shared settings (`NPROC`, `OUT_
 | MTEB v2 (41 tasks) | supervised SimCSE on 312,663 NLI triplets with attentive pooling (maximum length 64), then MTEB(eng, v2) at length 512 | `bash scripts/eval_mteb.sh` |
 | BEIR (15 datasets), MLDR | MS MARCO stage (1.25M triplets, mean pooling; a sentence-transformers port of ModernBERT's `train_st.py`), BEIR at length 512, MLDR at 8,192 | `bash scripts/eval_dpr.sh` |
 | CodeSearchNet, StackOverflowQA | the same MS MARCO checkpoint at length 8,192 | `bash scripts/eval_code.sh` |
-| NanoBEIR (13 subsets) | the MS MARCO stage on 250k triplets, length 512 | `NANOBEIR_MODE=dpr DPR_BUDGET=lite bash scripts/eval_nanobeir.sh` |
+| NanoBEIR (13 subsets) | the MS MARCO stage on 250k triplets, length 512 | `bash scripts/eval_nanobeir.sh` |
 | Throughput | forward pass, 65,536 tokens per batch, bf16, `torch.compile`, 5 rounds of 5 timed passes | `uv run python src/nexterabert/model_speedbench.py` |
-| Masked-token loss vs. length | 15% masking, 25 draws of up to 32 windows per length | `uv run python src/nexterabert/model_pplbench.py --models nextera modernbert neobert lfm --seq_lengths 1024 2048 4096 8192 16384 32768 65536` |
-
-`eval_dpr.sh` also runs an in-domain MLDR pass (training on the MLDR training split);
-`RUN_MLDR_ID=0` skips it.
+| Masked-token loss vs. length | 15% masking, 25 draws of up to 32 windows per length | `uv run python src/nexterabert/model_pplbench.py` |
 
 **Baselines under the same protocol.** Every stage also accepts a Hugging Face encoder
 as `MODEL`, which goes through the same fine-tuning, head and scorer
@@ -304,29 +292,9 @@ NeoBERT and LFM2.5-Encoder-230M one model per GPU and write a comparison table:
 ```bash
 bash scripts/eval_mteb_baselines.sh
 bash scripts/eval_nanobeir_baselines.sh
-bash scripts/eval_longembed_baselines.sh
 MODEL=answerdotai/ModernBERT-base bash scripts/eval_nlu.sh
 MODEL=answerdotai/ModernBERT-base bash scripts/eval_dpr.sh
 ```
-
-**ModernBERT's Table 1 suite.** `scripts/run_eval_suite.sh` runs the DPR, ColBERT, GLUE
-and code stages for one model and `scripts/summarize_eval_suite.py` folds them into a
-table row:
-
-```bash
-bash scripts/run_eval_suite.sh                 # RikkaBotan/NexteraBERT-Mezzoforte-220M-en
-MODEL=checkpoints/mezzoforte_bert/phase2/backbone NPROC=4 RUN_COLBERT=0 bash scripts/run_eval_suite.sh
-```
-
-**Other stages.**
-
-| Stage | Command |
-|---|---|
-| NanoBEIR zero-shot (raw backbone, mean pooling, no fine-tuning) | `bash scripts/eval_nanobeir.sh` |
-| LongEmbed (6 long-context retrieval tasks, on the MS MARCO checkpoint) | `bash scripts/eval_longembed.sh` |
-| ColBERT (PyLate knowledge distillation, then BEIR and MLDR) | `bash scripts/eval_colbert.sh` |
-| GLUE hyperparameter search, then the final multi-seed run | `GLUE_SEARCH=1 bash scripts/eval_nlu.sh` |
-| Why a BEIR / LongEmbed score looks the way it does | `scripts/diagnose_retrieval.py`, `scripts/diagnose_longembed.py` |
 
 The Python entry points can also be called directly, for example:
 
@@ -365,19 +333,14 @@ scripts/
   upload_to_hub.py, upload_mlm_head.py      push a backbone (or only its MLM head) to the Hub
   verify_hub_model.py                       check that a Hub repo loads with trust_remote_code
   eval_common.sh                            shared settings of the eval_*.sh scripts
-  eval_nlu.sh, evaluate_glue.py, search_glue.py            GLUE
+  eval_nlu.sh, evaluate_glue.py                            GLUE
   eval_mteb.sh, finetune_contrastive.py, evaluate_mteb.py  SimCSE stage and MTEB
   eval_dpr.sh, train_st_dpr.py, evaluate_retrieval.py      MS MARCO stage, BEIR, MLDR
   eval_code.sh                              CodeSearchNet, StackOverflowQA
   eval_nanobeir.sh                          NanoBEIR
-  eval_longembed.sh                         LongEmbed
-  eval_colbert.sh, train_colbert.py, evaluate_colbert.py   ColBERT via PyLate
-  run_eval_suite.sh                         DPR + ColBERT + GLUE + code for one model
   eval_*_baselines.sh                       the same stages for the baseline encoders
+  merge_retrieval_results.py                merge per-task retrieval results
   summarize_*.py                            result tables
-  check_neobert_checkpoint.py               detect diverged (NaN) or broken fine-tuned checkpoints
-  diagnose_retrieval.py, diagnose_longembed.py             retrieval diagnostics
-  verify_unpadding.py                       exactness and speed of unpadded inference
 ```
 
 ## License

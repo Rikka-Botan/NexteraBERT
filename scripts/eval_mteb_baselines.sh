@@ -60,7 +60,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path("scripts").resolve()))
 import finetune_contrastive as fc
-fc.build_triplets("nli", cache=sys.argv[1])
+fc.build_triplets(cache=sys.argv[1])
 EOF
 fi
 

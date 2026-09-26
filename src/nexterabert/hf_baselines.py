@@ -31,8 +31,8 @@ Everything model-specific lives here:
   ``(loss, logits)`` contract ``scripts/evaluate_glue.py`` trains.
 * **Forward.** NeoBERT expands the ``(B, T)`` key-padding mask to ``(B, H, T,
   T)`` with ``repeat`` -- 96 GiB of int64 for 16 x 8192 tokens. Every NeoBERT opened
-  here (and, through :func:`repair_wrapped_neobert`, inside sentence-transformers /
-  PyLate) is given a broadcastable ``(B, 1, 1, T)`` bool mask instead, with
+  here (and, through :func:`repair_wrapped_neobert`, inside sentence-transformers)
+  is given a broadcastable ``(B, 1, 1, T)`` bool mask instead, with
   bit-identical outputs; see :func:`broadcast_neobert_mask`.
 * **Pooling.** :class:`HFForSentenceEmbedding` puts the same
   :class:`~nexterabert.simcse.AttentivePooling` head (or the same masked mean)
@@ -249,10 +249,10 @@ def broadcast_neobert_mask(model) -> bool:
 
 
 def repair_wrapped_neobert(wrapper, max_len: int | None = None) -> int:
-    """Repair every NeoBERT living inside ``wrapper`` (a SentenceTransformer, a PyLate
-    ColBERT, any ``nn.Module``). Returns how many were repaired.
+    """Repair every NeoBERT living inside ``wrapper`` (a SentenceTransformer, any
+    ``nn.Module``). Returns how many were repaired.
 
-    sentence-transformers and PyLate open the encoder with their own plain
+    sentence-transformers opens the encoder with its own plain
     ``AutoModel.from_pretrained``, so none of :func:`load_hf_encoder`'s repairs reach
     it, and NeoBERT needs both of them:
 
@@ -410,10 +410,9 @@ def ensure_automodel_loadable(name_or_dir, cache_dir="checkpoints/hub") -> str:
     """A path that a PLAIN ``AutoModel.from_pretrained`` opens correctly.
 
     The loaders in this module repair a broken checkpoint layout in memory, but
-    third-party trainers build their own model: sentence-transformers
-    (``scripts/train_st_dpr.py``, the DPR stage behind BEIR / MLDR / CoIR) and
-    PyLate both call ``AutoModel.from_pretrained`` themselves. For
-    LFM2.5-Encoder that call returns a **randomly initialised** encoder (see
+    sentence-transformers (``scripts/train_st_dpr.py``, the DPR stage behind BEIR /
+    MLDR / CoIR) builds its own model and calls ``AutoModel.from_pretrained``
+    itself. For LFM2.5-Encoder that call returns a **randomly initialised** encoder (see
     ``load_hf_encoder``) -- the run would train and score noise without a single
     error. This materialises the repaired backbone once, as an ordinary model
     directory (weights under the keys the bare class expects, remote code and
@@ -472,7 +471,7 @@ def ensure_automodel_loadable(name_or_dir, cache_dir="checkpoints/hub") -> str:
             json.dump({"source": path, "reasons": reasons}, f, indent=2)
         try:
             os.replace(tmp, dest)
-        except OSError:                  # a parallel sweep job got there first
+        except OSError:                  # a parallel job got there first
             if not (dest / BACKBONE_REPAIR_FILE).is_file():
                 raise
     finally:
@@ -784,9 +783,8 @@ def load_hf_contrastive_model(name_or_dir, pooling: str = "auto",
     """Rebuild :class:`HFForSentenceEmbedding` from a Hub id or a saved directory.
 
     ``pooling="auto"`` follows the directory: a trained ``pooling_head.pt`` makes
-    it attentive, otherwise masked mean -- a raw Hub id therefore scores exactly
-    as the old mean-pool baseline path did. Returns ``(model, config, info)``
-    with ``info["pooling_head"]`` saying whether a trained head was found.
+    it attentive, otherwise masked mean. Returns ``(model, config, info)`` with
+    ``info["pooling_head"]`` saying whether a trained head was found.
     """
     encoder, config = load_hf_encoder(name_or_dir, max_len=max_len)
     head_path = Path(str(name_or_dir)) / POOLING_HEAD_FILE

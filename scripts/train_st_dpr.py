@@ -22,22 +22,9 @@ layerwise LR decay, weight decay, collator) is in the path:
 
     python scripts/train_st_dpr.py --model RikkaBotan/NexteraBERT-Mezzoforte-220M-en \
         --output_dir checkpoints/st_dpr/lr8e-5 --lr 8e-5
-    python scripts/train_st_dpr.py --model bert-base-uncased ...        # the paper's BERT-base row
-
-``--dataset mldr`` runs the paper's "Single Vector - In Domain" pass (3.1.3):
-continue from a trained DPR directory on the English MLDR training split
-(``--max_seq_length 8192``). The paper states no hyperparameters for it. A first
-guess (the DPR lr 8e-5) pushed the in-domain score below the out-of-domain one,
-so the defaults are conservative -- lr 2e-5, one sampled negative per query (~10k
-triplets; the best measured setting, 41.6, while all 20 mined negatives over-trained
-to 37.8; ``--negatives k`` samples k), batch 32, one epoch -- and 500 training
-queries are held out
-for a TripletEvaluator whose accuracy (``heldout_triplet_accuracy`` in
-``contrastive_run.json``) lets scripts/eval_dpr.sh pick the lr of a sweep without
-touching the test split.
 
 The output is an ordinary sentence-transformers directory plus this repo's
-``contrastive_run.json`` marker (protocol ``st-msmarco`` / ``st-mldr``), which
+``contrastive_run.json`` marker (protocol ``st-msmarco``), which
 ``scripts/evaluate_retrieval.py`` recognises and scores through mteb exactly as
 the reference ``evaluate_st.py`` does.
 """
@@ -56,30 +43,15 @@ for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, "reconfigure") and (_stream.encoding or "").lower() not in ("utf-8", "utf8"):
         _stream.reconfigure(encoding="utf-8", errors="replace")
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 MSMARCO_DATASET = ("sentence-transformers/msmarco-co-condenser-margin-mse-sym-mnrl-mean-v1",
                    "triplet-hard")
 RUN_FILE = "contrastive_run.json"
-PROTOCOLS = {
-    # ModernBERT examples/train_st.py, verbatim values
-    "msmarco": {"protocol": "st-msmarco", "batch_size": 512, "max_samples": 1_250_000,
-                "eval_size": 1000, "lr": 8e-5, "eval_batch_size": 16},
-    # 3.1.3 in-domain pass; the paper states no hyperparameters and publishes no
-    # script for it (only the MS MARCO stage). A first guess at the DPR lr (8e-5)
-    # LOWERED the in-domain score below the out-of-domain one (36.3 -> 29.5 on
-    # nextera-130B), so the lr is a conservative 2e-5. One sampled negative per
-    # query (~10k triplets of 8192-token documents, batch 32, one epoch) is the
-    # best measured setting: 36.3 OOD -> 41.6 ID on nextera-130B, whereas all 20
-    # mined negatives (~190k triplets, 20x the steps over the same 10k queries)
-    # over-trained and fell to 37.8. --negatives <k> samples k per query; select
-    # such variants on the MLDR dev split (diagnose_retrieval.py --split dev),
-    # never on test. 500 whole queries are held out for the TripletEvaluator.
-    "mldr": {"protocol": "st-mldr", "batch_size": 32, "max_samples": 0,
-             "eval_size": 500, "lr": 2e-5, "negatives": "one", "eval_batch_size": 4},
-}
-PROTOCOLS["msmarco"]["negatives"] = "one"   # the dataset already has one per row
+PROTOCOL = "st-msmarco"
+# ModernBERT examples/train_st.py, verbatim values
+DEFAULTS = {"batch_size": 512, "max_samples": 1_250_000, "eval_size": 1000, "lr": 8e-5,
+            "eval_batch_size": 16}
 
 
 def parse_args(argv=None):
@@ -90,30 +62,24 @@ def parse_args(argv=None):
                         "any HF encoder (bert-base-uncased, answerdotai/ModernBERT-base), or "
                         "a sentence-transformers directory to continue from")
     p.add_argument("--output_dir", required=True)
-    p.add_argument("--dataset", default="msmarco", choices=sorted(PROTOCOLS))
     p.add_argument("--lr", type=float, default=None,
                    help="peak learning rate (default 8e-5, ModernBERT-base's Table 9 value)")
     p.add_argument("--batch_size", type=int, default=None,
-                   help="per-device batch = in-batch negatives + 1 (default 512 / mldr 32)")
+                   help="per-device batch = in-batch negatives + 1 (default 512)")
     p.add_argument("--mini_batch_size", type=int, default=16,
                    help="CachedMNRL forward chunk; memory only, does not change the loss")
     p.add_argument("--eval_batch_size", type=int, default=None,
-                   help="TripletEvaluator encode batch (default 16; mldr 4 -- its "
-                        "held-out documents are 8192 tokens long)")
+                   help="TripletEvaluator encode batch (default 16)")
     p.add_argument("--max_samples", type=int, default=None,
                    help="training rows (default 1,250,000; 0 = all)")
     p.add_argument("--eval_size", type=int, default=None,
-                   help="held-out triplets (msmarco: rows, reference 1000) or queries "
-                        "(mldr: default 500) for the TripletEvaluator; 0 = none")
-    p.add_argument("--negatives", default=None,
-                   help="mldr only: 'one' (default, ~10k triplets; best measured), an "
-                        "integer k to sample k of the 20 mined negatives per query, or "
-                        "'all' (~190k triplets, 20x the steps; over-trained: 37.8 vs 41.6)")
+                   help="held-out triplets for the TripletEvaluator (reference 1000); "
+                        "0 = none")
     p.add_argument("--epochs", type=float, default=1.0)
     p.add_argument("--warmup_ratio", type=float, default=0.05)
     p.add_argument("--max_seq_length", type=int, default=None,
                    help="override the model's max_seq_length (the reference leaves it "
-                        "at the model's own; use 8192 for --dataset mldr)")
+                        "at the model's own)")
     p.add_argument("--pooling", default="mean", choices=["mean", "cls"],
                    help="pooling of a freshly wrapped encoder (the reference: mean)")
     p.add_argument("--dtype", default="bf16", choices=["bf16", "fp16", "fp32"])
@@ -132,8 +98,8 @@ def parse_args(argv=None):
     p.add_argument("--revision", default=None)
     p.add_argument("--work_dir", default=None, help="trainer scratch dir (default <output_dir>/_trainer)")
     args = p.parse_args(argv)
-    for key, value in PROTOCOLS[args.dataset].items():
-        if key != "protocol" and getattr(args, key, None) is None:
+    for key, value in DEFAULTS.items():
+        if getattr(args, key, None) is None:
             setattr(args, key, value)
     return args
 
@@ -209,83 +175,30 @@ def complete_remote_code(model, output_dir) -> list:
     return _copy_remote_code(auto_model, Path(output_dir))
 
 
-def triplet_dataset(rows):
-    """A ``datasets.Dataset`` of (query, positive, negative) rows.
-
-    The text columns are typed ``large_string`` (64-bit offsets): MLDR documents run
-    to tens of thousands of characters and ~70k triplets put a column past the 2 GB
-    that pyarrow's default ``string`` type can address, which surfaces as
-    "offset overflow while concatenating arrays" inside datasets' fingerprinting.
-    """
-    from datasets import Dataset, Features, Value
-
-    features = Features({"query": Value("large_string"), "positive": Value("large_string"),
-                         "negative": Value("large_string")})
-    return Dataset.from_dict({"query": [t[0] for t in rows],
-                              "positive": [t[1] for t in rows],
-                              "negative": [t[2] for t in rows]}, features=features)
-
-
 def load_triplets(args):
     """(train Dataset, eval Dataset | None) with columns query / positive / negative."""
     from datasets import load_dataset
 
-    if args.dataset == "msmarco":
-        name, config = MSMARCO_DATASET
-        dataset = load_dataset(name, config, split="train")
-        eval_dataset = None
-        if args.eval_size and args.eval_size > 0:
-            split = dataset.train_test_split(test_size=args.eval_size, seed=args.split_seed)
-            dataset, eval_dataset = split["train"], split["test"]
-        if args.max_samples and args.max_samples < len(dataset):
-            dataset = dataset.select(range(args.max_samples))   # the reference takes the head
-        print(f"[data] {name} [{config}]: {len(dataset)} train triplets"
-              + (f", {len(eval_dataset)} held out" if eval_dataset is not None else ""))
-        return dataset, eval_dataset
-
-    import random
-
-    from finetune_contrastive import build_mldr_triplets
-
-    triplets = build_mldr_triplets(max_samples=args.max_samples or 0,
-                                   negatives=args.negatives or "one")
-    # hold out whole queries (a query's triplets are adjacent in the list), so the
-    # evaluator never sees a query that was trained on
-    eval_triplets = []
+    name, config = MSMARCO_DATASET
+    dataset = load_dataset(name, config, split="train")
+    eval_dataset = None
     if args.eval_size and args.eval_size > 0:
-        queries = list(dict.fromkeys(t[0] for t in triplets))
-        held = set(random.Random(args.split_seed).sample(
-            queries, min(args.eval_size, max(len(queries) // 10, 1))))
-        eval_triplets = [t for t in triplets if t[0] in held]
-        triplets = [t for t in triplets if t[0] not in held]
-
-    def as_dataset(rows):
-        return triplet_dataset(rows)
-
-    print(f"[data] MLDR-en train: {len(triplets)} train triplets"
-          + (f", {len(eval_triplets)} held out ({len(held)} queries)" if eval_triplets else ""))
-    return as_dataset(triplets), (as_dataset(eval_triplets) if eval_triplets else None)
+        split = dataset.train_test_split(test_size=args.eval_size, seed=args.split_seed)
+        dataset, eval_dataset = split["train"], split["test"]
+    if args.max_samples and args.max_samples < len(dataset):
+        dataset = dataset.select(range(args.max_samples))   # the reference takes the head
+    print(f"[data] {name} [{config}]: {len(dataset)} train triplets"
+          + (f", {len(eval_dataset)} held out" if eval_dataset is not None else ""))
+    return dataset, eval_dataset
 
 
-def protocol_name(args, n_triplets: int) -> str:
+def protocol_name(n_triplets: int) -> str:
     """``st-msmarco`` only for the published budget. A run on fewer triplets
     (DPR_BUDGET=lite, a smoke run) records e.g. ``st-msmarco-250k``, so no summary
-    can file it as the paper-comparable stage."""
-    name = PROTOCOLS[args.dataset]["protocol"]
-    reference = PROTOCOLS[args.dataset]["max_samples"]
-    if args.dataset == "msmarco" and reference and n_triplets < reference:
-        return f"{name}-{max(n_triplets // 1000, 1)}k"
-    return name
-
-
-def triplet_accuracy(metrics) -> float | None:
-    """The accuracy out of a TripletEvaluator result (a {name_fn_accuracy: value} dict)."""
-    if isinstance(metrics, (int, float)):
-        return float(metrics)
-    if isinstance(metrics, dict):
-        values = [float(v) for k, v in metrics.items() if "accuracy" in k]
-        return max(values) if values else None
-    return None
+    can file it as the full stage."""
+    if n_triplets < DEFAULTS["max_samples"]:
+        return f"{PROTOCOL}-{max(n_triplets // 1000, 1)}k"
+    return PROTOCOL
 
 
 def check_dependencies():
@@ -351,14 +264,13 @@ def main(argv=None):
         evaluator = TripletEvaluator(anchors=eval_dataset["query"],
                                      positives=eval_dataset["positive"],
                                      negatives=eval_dataset["negative"],
-                                     name="msmarco-co-condenser-dev" if args.dataset == "msmarco"
-                                     else "mldr-en-heldout",
+                                     name="msmarco-co-condenser-dev",
                                      batch_size=args.eval_batch_size)
         before = evaluator(model)
         print(f"[st] triplet accuracy before training: {before}")
 
     steps = int(len(train_dataset) // args.batch_size * args.epochs)
-    print(f"[st] {protocol_name(args, len(train_dataset))}: lr={args.lr:.1e} bs={args.batch_size} "
+    print(f"[st] {protocol_name(len(train_dataset))}: lr={args.lr:.1e} bs={args.batch_size} "
           f"(mini {args.mini_batch_size}) epochs={args.epochs} steps~{steps} "
           f"warmup={args.warmup_ratio:.0%} max_seq_length={model.max_seq_length} dtype={args.dtype}")
     from transformers import TrainerCallback
@@ -397,13 +309,12 @@ def main(argv=None):
             + (f"{diverged['what']}={diverged['value']} at step {diverged['step']}"
                if diverged else "non-finite weights after training")
             + (f"; non-finite tensors e.g. {bad[:3]}" if bad else "")
-            + ". Nothing was saved. Use a lower --lr (the protocol sweeps 1e-5 ... "
-              "1e-4 per model for exactly this reason: DPR_LRS=\"1e-5 2e-5 3e-5 5e-5\" "
-              "bash scripts/eval_dpr.sh) or --dtype fp32.")
+            + ". Nothing was saved. Use a lower --lr (DPR_LR=5e-5 bash "
+              "scripts/eval_dpr.sh) or --dtype fp32.")
 
     # Save BEFORE the post-training evaluation: the evaluation is optional
-    # bookkeeping, the checkpoint is the product, and an OOM while encoding
-    # 8192-token held-out documents must not throw the training away.
+    # bookkeeping, the checkpoint is the product, and an OOM during it must not
+    # throw the training away.
     os.makedirs(args.output_dir, exist_ok=True)
     model.save(args.output_dir, create_model_card=False)
     copied = complete_remote_code(model, args.output_dir)
@@ -426,12 +337,12 @@ def main(argv=None):
         except torch.OutOfMemoryError as err:
             print(f"[warn] post-training TripletEvaluator ran out of GPU memory "
                   f"({str(err).splitlines()[0][:120]}); the checkpoint is saved, only "
-                  f"heldout_triplet_accuracy is missing. Re-run with a smaller "
+                  f"triplet_eval_after is missing. Re-run with a smaller "
                   f"--eval_batch_size to record it.")
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
     summary = {
-        "protocol": protocol_name(args, len(train_dataset)),
+        "protocol": protocol_name(len(train_dataset)),
         "source": "Warner et al. 2024, 3.1.2 + App. E.2; AnswerDotAI/ModernBERT examples/train_st.py",
         "framework": "sentence-transformers",
         "pooling": args.pooling if not (os.path.isdir(args.model) and
@@ -439,8 +350,7 @@ def main(argv=None):
         else "inherited",
         "model": args.model,
         "loaded_from": getattr(args, "loaded_from", args.model),
-        "dataset": MSMARCO_DATASET[0] + "/" + MSMARCO_DATASET[1] if args.dataset == "msmarco"
-        else "Shitao/MLDR en train",
+        "dataset": MSMARCO_DATASET[0] + "/" + MSMARCO_DATASET[1],
         "triplets": len(train_dataset),
         "steps": steps,
         "batch_size": args.batch_size,
@@ -452,12 +362,9 @@ def main(argv=None):
         "loss": "CachedMultipleNegativesRankingLoss (scale 20)",
         "dtype": args.dtype,
         "seed": args.seed,
-        "negatives": args.negatives,
         "eval_size": args.eval_size,
         "triplet_eval_before": before,
         "triplet_eval_after": after,
-        # the number eval_dpr.sh selects an MLDR lr sweep on
-        "heldout_triplet_accuracy": triplet_accuracy(after),
         "wall_clock_seconds": wall,
     }
     with open(os.path.join(args.output_dir, RUN_FILE), "w", encoding="utf-8") as f:

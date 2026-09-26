@@ -1,23 +1,18 @@
-"""Sentence-embedding heads + the InfoNCE loss both published protocols use.
+"""Sentence-embedding heads + the InfoNCE loss of the MTEB stage.
 
-MTEB and BEIR score a single vector per text, but an MLM/RTD-pretrained encoder
-emits one vector per token and was never trained to place related texts near each
-other. Every published number on either benchmark therefore comes from a model
-that first learned to embed, under one of two recipes:
+MTEB scores a single vector per text, but an MLM-pretrained encoder emits one
+vector per token and was never trained to place related texts near each other.
+Published MTEB numbers therefore come from a model that first learned to embed;
+the recipe here is OptiBERT's (Dervishi et al., EMNLP 2025, App. D.2): an
+attentive pooling head, fine-tuned end-to-end on MNLI+SNLI triplets with
+supervised-SimCSE InfoNCE for 3 epochs (Gao et al., 2021). Their Table 5 follows
+this.
 
-* **MTEB** -- OptiBERT (Dervishi et al., EMNLP 2025, App. D.2): an attentive
-  pooling head, fine-tuned end-to-end on MNLI+SNLI triplets with supervised-SimCSE
-  InfoNCE for 3 epochs (Gao et al., 2021). Their Table 5 follows this.
-* **Retrieval** -- ModernBERT (Warner et al., 2024, 3.1.2): plain mean pooling,
-  fine-tuned on 1.25M MS MARCO pairs with mined hard negatives. Their Table 7 BEIR
-  scores (BERT-base 38.9, ModernBERT-base 41.6) follow this. sentence-transformers'
-  MultipleNegativesRankingLoss is the same InfoNCE at scale 20 = temperature 0.05.
-
-Comparing a raw backbone against either table compares protocols, not models.
-
-`scripts/finetune_contrastive.py` runs both; `nexterabert.mteb_encoder` picks the
-result up automatically -- an attentive run leaves ``pooling_head.pt`` beside the
-backbone, and either run records what it did in ``contrastive_run.json``.
+`scripts/finetune_contrastive.py` runs it; `nexterabert.mteb_encoder` picks the
+result up automatically -- the run leaves ``pooling_head.pt`` beside the backbone
+and records what it did in ``contrastive_run.json``. (The MS MARCO stage behind
+BEIR / MLDR / CoIR is ModernBERT's, run with sentence-transformers in
+`scripts/train_st_dpr.py`.)
 """
 
 from __future__ import annotations
@@ -178,12 +173,11 @@ def contrastive_run(path) -> dict | None:
 
 def load_contrastive_model(pretrained_path: str, pooling: str = "attentive",
                            **config_overrides):
-    """Load a model in the pooling variant a protocol trains.
+    """Load a model in the pooling variant a run trains.
 
     ``attentive`` builds ``NexteraBERTForSentenceEmbedding`` (encoder + trained
     head); ``mean`` builds ``NexteraBERTForEmbedding``, whose pooling is the
-    backbone's own masked mean -- ModernBERT's retrieval protocol tunes the
-    encoder itself and adds no parameters.
+    backbone's own masked mean (no extra parameters).
     """
     if pooling == "mean":
         from .loading import load_for_task

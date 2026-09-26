@@ -8,33 +8,30 @@ per-task-type means, which stops the task-heavy types (Classification, Retrieval
 from dominating the headline number. OptiBERT's tables call the latter "Avg".
 
 Point --model at a directory produced by scripts/finetune_contrastive.py and the
-trained attentive pooling head is used automatically (--pooling auto); a raw
-backbone falls back to masked mean pooling, which is NOT the protocol published
-MTEB numbers are measured under -- see that script's docstring. The protocol that
-produced the checkpoint is reported in the summary.
+trained attentive pooling head is used automatically (--pooling auto). The
+protocol that produced the checkpoint is reported in the summary.
 
     # English MTEB v2 (41 tasks, hours on one GPU)
-    python scripts/finetune_contrastive.py --model checkpoints/discriminator         --output_dir checkpoints/simcse
+    python scripts/finetune_contrastive.py --model checkpoints/phase2/backbone \
+        --output_dir checkpoints/simcse
     python scripts/evaluate_mteb.py --model checkpoints/simcse
 
-    # A quick subset: two task types, 4 tasks, small model context
-    python scripts/evaluate_mteb.py --model checkpoints/discriminator \
+    # A quick subset: two task types, 4 tasks
+    python scripts/evaluate_mteb.py --model checkpoints/simcse \
         --task_types STS,PairClassification --max_tasks 4
 
     # Named tasks only
-    python scripts/evaluate_mteb.py --model checkpoints/discriminator \
+    python scripts/evaluate_mteb.py --model checkpoints/simcse \
         --tasks STS12,STSBenchmark,Banking77Classification
 
     # Baselines under the SAME protocol (see nexterabert.hf_baselines):
-    python scripts/finetune_contrastive.py --hf_model answerdotai/ModernBERT-base         --output_dir checkpoints/baselines/ModernBERT-base/simcse
+    python scripts/finetune_contrastive.py --hf_model answerdotai/ModernBERT-base \
+        --output_dir checkpoints/baselines/ModernBERT-base/simcse
     python scripts/evaluate_mteb.py --model checkpoints/baselines/ModernBERT-base/simcse
-    #   zero-shot mean pooling of a raw Hub checkpoint, the old reference path:
-    python scripts/evaluate_mteb.py --hf_model chandar-lab/NeoBERT
 
 Results are cached per task under --cache_dir, so an interrupted run resumes
 where it stopped (the default --overwrite only-missing reruns missing splits
-only). `scripts/evaluate_retrieval.py` is the retrieval-only shortcut; both share
-the encoder in `nexterabert.mteb_encoder`.
+only). The encoder lives in `nexterabert.mteb_encoder`.
 """
 
 from __future__ import annotations
@@ -59,17 +56,12 @@ DEFAULT_TOKENIZER = "answerdotai/ModernBERT-base"
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--model",
-                   help="NexteraBERT backbone directory, or a directory written by "
-                        "finetune_contrastive.py --hf_model (opened as an AutoModel)")
-    p.add_argument("--hf_model",
-                   help="score a Hugging Face AutoModel (answerdotai/ModernBERT-base, "
-                        "chandar-lab/NeoBERT, bert-base-uncased, ...) through the "
-                        "identical tokenisation/pooling/scoring path instead; a raw "
-                        "Hub id is mean-pooled zero-shot -- the reference point for "
-                        "judging whether a score is low")
+    p.add_argument("--model", required=True,
+                   help="directory written by finetune_contrastive.py: a NexteraBERT "
+                        "model, or a --hf_model baseline (opened as an AutoModel)")
     p.add_argument("--tokenizer", default=None,
-                   help="default: ModernBERT's for --model, the baseline's own for --hf_model")
+                   help="default: ModernBERT's for a NexteraBERT model, the baseline's "
+                        "own for a baseline directory")
     p.add_argument("--pooling", default="auto", choices=["auto", "mean", "attentive"],
                    help="auto uses the SimCSE attentive head when the model dir has "
                         "one (scripts/finetune_contrastive.py), else masked mean pooling")
@@ -102,20 +94,17 @@ def parse_args():
                    help="processes used for dataset loading/transformation")
     p.add_argument("--skip_errors", action="store_true",
                    help="keep going when a task fails instead of raising")
-    args = p.parse_args()
-    if not args.model and not args.hf_model:
-        p.error("pass --model (a NexteraBERT backbone) or --hf_model (a baseline)")
-    return args
+    return p.parse_args()
 
 
 def build_encoder(args):
     embedding_cache_dir = args.embedding_cache_dir
     if embedding_cache_dir is None and args.cache_dir:
         embedding_cache_dir = str(Path(args.cache_dir) / "_embedding_spill")
-    if args.hf_model or is_hf_model_dir(args.model):
+    if is_hf_model_dir(args.model):
         # a baseline uses its own tokenizer unless one was named explicitly; a
         # SimCSE'd baseline directory picks up its pooling head like --model does
-        return HFEncoder(args.hf_model or args.model, args.tokenizer,
+        return HFEncoder(args.model, args.tokenizer,
                          args.max_len, args.batch_size, pooling=args.pooling,
                          embedding_cache_dir=embedding_cache_dir,
                          embedding_memmap_threshold_mb=
@@ -206,7 +195,7 @@ def summarise(results, errors, type_by_name, args, wall_clock, pooling="mean",
     type_means = {t: float(np.mean(v)) for t, v in sorted(per_type.items())}
     all_scores = [v["score"] for v in per_task.values() if not np.isnan(v["score"])]
     return {
-        "model": args.hf_model or args.model,
+        "model": args.model,
         "benchmark": args.tasks or args.benchmark,
         "max_len": args.max_len,
         "pooling": pooling,

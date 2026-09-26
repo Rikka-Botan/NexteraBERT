@@ -13,23 +13,21 @@
 #   MODEL=chandar-lab/NeoBERT bash scripts/eval_mteb.sh
 #   MODEL=LiquidAI/LFM2.5-Encoder-230M bash scripts/eval_mteb.sh
 #   MODEL=checkpoints/mezzoforte_bert/phase2/backbone bash scripts/eval_mteb.sh
-#   MTEB_ZEROSHOT=1 bash scripts/eval_mteb.sh                         # + raw mean-pool run
 #   MTEB_TASK_TYPES=STS,PairClassification MTEB_MAX_TASKS=4 bash scripts/eval_mteb.sh   # smoke
 #   scripts/eval_mteb_baselines.sh runs this for several models at once.
 #
 # Knobs (all optional; see scripts/eval_common.sh for MODEL / OUT_DIR / NPROC):
 #   SIMCSE_DIR         where the tuned model goes    (default ${OUT_DIR}/simcse)
 #   SIMCSE_LR          5e-5 (OptiBERT / SimCSE)      SIMCSE_BATCH_SIZE 512 (halve on OOM)
-#   SIMCSE_EXTRA_ARGS  e.g. "--no_llrd" for the flat published optimiser
+#   SIMCSE_EXTRA_ARGS  more finetune_contrastive.py args, e.g. "--no_llrd": LLRD factor
+#                      1.0, the other side of the LLRD comparison (use its own OUT_DIR)
 #   TRIPLETS_CACHE     NLI triplets JSON, shared between models
 #                      (default ${HUB_CACHE_DIR}/nli_triplets.json)
 #   MTEB_BENCHMARK     "MTEB(eng, v2)"               MTEB_MAX_LEN 512   MTEB_BATCH_SIZE 64
 #   MTEB_TASK_TYPES / MTEB_TASKS / MTEB_EXCLUDE_TASKS / MTEB_MAX_TASKS  -> evaluate_mteb.py
 #   MTEB_EXTRA_ARGS    anything else for evaluate_mteb.py
-#   MTEB_ZEROSHOT=1    also score the raw backbone with mean pooling
-#                      (the "before" side; NOT comparable to published tables)
 #
-# Output: ${OUT_DIR}/mteb_simcse.json   (+ ${OUT_DIR}/mteb_zeroshot.json)
+# Output: ${OUT_DIR}/mteb_simcse.json
 #         per-task cache under ${MTEB_CACHE}, so a killed run resumes.
 # Both stages are single-process (InfoNCE negatives come from one forward pass);
 # pin a GPU with CUDA_VISIBLE_DEVICES. Rough cost on one H100: SimCSE ~1 h at
@@ -52,9 +50,7 @@ MTEB_TASKS="${MTEB_TASKS:-}"
 MTEB_EXCLUDE_TASKS="${MTEB_EXCLUDE_TASKS:-}"
 MTEB_MAX_TASKS="${MTEB_MAX_TASKS:-0}"
 MTEB_EXTRA_ARGS="${MTEB_EXTRA_ARGS:-}"
-MTEB_ZEROSHOT="${MTEB_ZEROSHOT:-0}"
 MTEB_OUT="${OUT_DIR}/mteb_simcse.json"
-ZEROSHOT_OUT="${OUT_DIR}/mteb_zeroshot.json"
 
 START=$(date +%s)
 mkdir -p "$OUT_DIR" "$(dirname "$TRIPLETS_CACHE")"
@@ -76,15 +72,6 @@ MTEB_ARGS=(--benchmark "$MTEB_BENCHMARK" --max_len "$MTEB_MAX_LEN" --batch_size 
 [ -n "$MTEB_TASKS" ]         && MTEB_ARGS+=(--tasks "$MTEB_TASKS")
 [ -n "$MTEB_EXCLUDE_TASKS" ] && MTEB_ARGS+=(--exclude_tasks "$MTEB_EXCLUDE_TASKS")
 [ "$MTEB_MAX_TASKS" != "0" ] && MTEB_ARGS+=(--max_tasks "$MTEB_MAX_TASKS")
-
-# -- optional: the raw backbone, mean pooling (the "before" side) --------------
-if [ "$MTEB_ZEROSHOT" = "1" ] && ! done_or_skip "$ZEROSHOT_OUT"; then
-    log "zero-shot MTEB (raw backbone, mean pooling) -> ${ZEROSHOT_OUT}"
-    # shellcheck disable=SC2086
-    "$PY" scripts/evaluate_mteb.py \
-        --model "$BACKBONE" --tokenizer "$TOKENIZER" --pooling mean \
-        "${MTEB_ARGS[@]}" --output "$ZEROSHOT_OUT" ${MTEB_EXTRA_ARGS}
-fi
 
 if done_or_skip "$MTEB_OUT"; then exit 0; fi
 

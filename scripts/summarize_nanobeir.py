@@ -1,19 +1,15 @@
 #!/usr/bin/env python
 """One NanoBEIR comparison table from several ``evaluate_retrieval.py`` result files.
 
-    python scripts/summarize_nanobeir.py eval_results/*/nanobeir_zeroshot.json
+    python scripts/summarize_nanobeir.py eval_results/*/nanobeir_dpr_lite.json
     python scripts/summarize_nanobeir.py eval_results/NexteraBERT-Mezzoforte-220M-en eval_results/ModernBERT-base \
-        --output eval_results/nanobeir_zeroshot_comparison.json
+        --output eval_results/nanobeir_dpr_lite_comparison.json
 
-Prints (and with --output saves as JSON + Markdown) one row per file: the stage
-the scored model went through ("zero-shot" = the raw backbone, mean pooling -- the
-default of scripts/eval_nanobeir.sh -- or the contrastive protocol of a DPR
-checkpoint), nDCG@10 x100 on each of the 13 NanoBEIR subsets and their mean. A
-DPR row also gets the full 15-dataset BEIR average its NanoBEIR mean is a proxy
-of, when the same directory holds the ``beir_dpr.json`` of scripts/eval_dpr.sh.
-Rows whose recorded settings (protocol, pooling, max_len, precision, batch size)
-differ are called out so the table never hides it. A directory argument resolves
-to its zero-shot file first, then the DPR one.
+Prints (and with --output saves as JSON + Markdown) one row per file: the
+contrastive stage the scored checkpoint went through, nDCG@10 x100 on each of the
+13 NanoBEIR subsets and their mean. Rows whose recorded settings (protocol,
+pooling, max_len, precision, batch size) differ are called out so the table never
+hides it. A directory argument resolves to its ``nanobeir_dpr_lite.json``.
 """
 
 from __future__ import annotations
@@ -34,8 +30,7 @@ TASKS = ["NanoMSMARCORetrieval", "NanoNFCorpusRetrieval", "NanoNQRetrieval",
          "NanoSCIDOCSRetrieval", "NanoFEVERRetrieval", "NanoClimateFeverRetrieval",
          "NanoSciFactRetrieval"]
 SETTINGS = ["_protocol", "_pooling", "_max_len", "_st_dtype", "_batch_size"]
-RESULT_NAMES = ("nanobeir_zeroshot.json", "nanobeir_dpr.json", "nanobeir_results.json")
-RAW = "none (raw backbone)"   # evaluate_retrieval.py's _protocol without a contrastive stage
+RESULT_NAMES = ("nanobeir_dpr_lite.json",)
 
 
 def short(task: str) -> str:
@@ -58,7 +53,7 @@ def load_row(path: Path) -> dict:
     data = json.loads(path.read_text(encoding="utf-8"))
     scores = {t: _x100(data.get(t)) for t in TASKS}
     done = [v for v in scores.values() if v is not None]
-    row = {
+    return {
         "file": str(path),
         "name": path.parent.name if path.parent.name not in ("", ".") else path.stem,
         "scores": scores,
@@ -66,46 +61,20 @@ def load_row(path: Path) -> dict:
         # against a full one without the n column showing it
         "average": sum(done) / len(done) if done else None,
         "n_tasks": len(done),
-        "beir_average": None,
-        "beir_n_tasks": None,
         **{k: data.get(k) for k in SETTINGS},
     }
-    # beir_dpr.json scores the DPR checkpoint: it says nothing about a raw backbone
-    beir = path.parent / "beir_dpr.json"
-    if row["_protocol"] != RAW and beir.is_file():
-        try:
-            b = json.loads(beir.read_text(encoding="utf-8"))
-            row["beir_average"] = _x100(b.get("average_ndcg@10"))
-            row["beir_n_tasks"] = len(b["_tasks"]) if isinstance(b.get("_tasks"), list) else None
-        except (OSError, ValueError):
-            pass
-    return row
 
 
 def render(rows: list[dict]) -> str:
-    # the BEIR column only exists for DPR rows; an all-zero-shot table drops it
-    with_beir = any(r["_protocol"] != RAW for r in rows)
-    header = ["Model", "Stage", *[short(t) for t in TASKS], "NanoBEIR", "n",
-              *(["BEIR"] if with_beir else [])]
+    header = ["Model", "Stage", *[short(t) for t in TASKS], "NanoBEIR", "n"]
     lines = ["| " + " | ".join(header) + " |",
              "|" + "|".join("---" for _ in header) + "|"]
     for r in rows:
-        beir = _fmt(r["beir_average"])
-        if r["beir_average"] is not None and r["beir_n_tasks"] not in (None, 15):
-            beir += f" ({r['beir_n_tasks']}/15)"
-        stage = "zero-shot" if r["_protocol"] == RAW else str(r["_protocol"] or "?")
-        cells = [r["name"], stage,
+        cells = [r["name"], str(r["_protocol"] or "?"),
                  *[_fmt(r["scores"][t]) for t in TASKS],
-                 _fmt(r["average"]), str(r["n_tasks"]), *([beir] if with_beir else [])]
+                 _fmt(r["average"]), str(r["n_tasks"])]
         lines.append("| " + " | ".join(cells) + " |")
     notes = ["nDCG@10 x100; NanoBEIR = mean over the n subsets scored."]
-    if with_beir:
-        notes.append("BEIR = that DPR checkpoint's beir_dpr.json average "
-                     "(scripts/eval_dpr.sh), when present.")
-    if any(r["_protocol"] == RAW for r in rows):
-        notes.append("zero-shot = the raw pretrained backbone, masked mean pooling, no "
-                     "contrastive stage: comparable across these rows, far below (and "
-                     "not comparable to) BEIR numbers measured after MS MARCO training.")
     for key in SETTINGS:
         values = {str(r[key]) for r in rows}
         if len(values) > 1:
@@ -124,7 +93,7 @@ def main(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument("results", nargs="+",
                    help="evaluate_retrieval.py NanoBEIR JSON files, or directories "
-                        "containing nanobeir_zeroshot.json / nanobeir_dpr.json")
+                        "containing nanobeir_dpr_lite.json")
     p.add_argument("--output", default=None, help="comparison JSON (+ .md beside it)")
     args = p.parse_args(argv)
 

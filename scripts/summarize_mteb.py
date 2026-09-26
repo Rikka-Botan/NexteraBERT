@@ -14,8 +14,8 @@ runs). ModernBERT's and NeoBERT's *paper* MTEB numbers are deliberately not
 listed: they are MTEB(eng, v1) after each paper's own, heavier contrastive
 pipeline, so the like-for-like comparison is the rows this script prints.
 
-Rows measured under different protocols (a zero-shot mean-pool run next to a
-SimCSE run) are printed with their protocol so the table never hides it.
+Every row is printed with the protocol its model went through, so a table that
+mixes protocols never hides it.
 """
 
 from __future__ import annotations
@@ -85,8 +85,7 @@ def render(rows: list[dict], reference: bool = True) -> str:
     lines = ["| " + " | ".join(header) + " |",
              "|" + "|".join("---" for _ in header) + "|"]
     for r in rows:
-        proto = r["protocol"] if r["protocol"] != "none (raw backbone)" else "zero-shot mean"
-        cells = [r["name"], proto, *[_fmt(r[t]) for t in TASK_TYPES],
+        cells = [r["name"], r["protocol"], *[_fmt(r[t]) for t in TASK_TYPES],
                  _fmt(r["mean_task_type"]), _fmt(r["mean_task"]), str(r["n_tasks"] or "-")]
         lines.append("| " + " | ".join(cells) + " |")
     if reference:
@@ -122,7 +121,7 @@ def main(argv=None):
     for item in args.results:
         path = Path(item)
         if path.is_dir():
-            for name in ("mteb_simcse.json", "mteb_results.json", "mteb_zeroshot.json"):
+            for name in ("mteb_simcse.json", "mteb_results.json"):
                 if (path / name).is_file():
                     paths.append(path / name)
                     break

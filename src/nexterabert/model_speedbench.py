@@ -1,9 +1,10 @@
 """Inference latency vs sequence length, NexteraBERT vs the field.
 
 The sibling ``model_pplbench.py`` plots *pseudo-perplexity* against sequence length;
-this plots **forward latency** for the same set of encoders, so the speed picture lines
-up with the quality picture. The model registry (``--models`` aliases, display names,
-plot styling) and the baseline repairs are shared with it rather than copied.
+this plots **forward latency** for the encoders of the speed comparison (a superset of
+the PPL bench's), so the speed picture lines up with the quality picture. Plot
+styling, the position-cap helpers and the baseline repairs are shared with it rather
+than copied.
 
 Measurement. The optimisation settings are the original script's, untouched:
 ``torch.compile(model, mode="reduce-overhead")`` applied **once per model**, ``eval()``
@@ -18,10 +19,9 @@ mean *is* the old ``elapsed / num_runs``.
 The sweep covers 1024 to 65536 tokens by default. Batch size follows the length:
 ``batch = --batch_tokens // seq_len`` (default 65536 tokens, clamped to
 ``1..--max_batch_size``), so every point pushes the same number of tokens through the
-model -- 64 x 1024, 32 x 2048, ... 1 x 65536. A fixed batch of 2 (the old behaviour,
-still available as ``--batch_size 2``) hands a GPU 2048 tokens at length 1024: the
-device idles between kernel launches and the measured tokens/s *falls* towards short
-lengths, which says nothing about the model. The
+model -- 64 x 1024, 32 x 2048, ... 1 x 65536. A fixed batch of 2 would hand a GPU
+2048 tokens at length 1024: the device idles between kernel launches and the measured
+tokens/s *falls* towards short lengths, which says nothing about the model. The
 latency figure therefore shows seconds **per sequence** (batch time / batch size),
 which stays comparable across lengths; the JSON keeps the raw per-batch runs and the
 batch size of every point.
@@ -49,41 +49,23 @@ The plot draws the interval as error bars plus a shaded band. Successive forward
 machine are not perfectly independent (clock/thermal drift), so read the interval as the
 run-to-run noise of *this* session, not as machine-to-machine variation.
 
-One opt-in variant measures something different and says so in the figure title:
-
-  * ``--sync_each_run`` synchronises after every forward. Each sample is then the
-    latency of one *isolated* request from an idle GPU, which adds the CPU-side launch
-    cost (dynamo guards, CUDA-graph input copies, any Python between graph segments)
-    that back-to-back queueing hides behind the previous forward's GPU work. It weighs
-    most on a launch-bound model at short lengths -- NexteraBERT more than the plain
-    transformers -- so never compare it against numbers taken without it.
-
-Models. ``--models`` takes the same aliases as ``model_pplbench`` (bert, roberta,
-electra, deberta, deberta-v3, modernbert, neobert, lfm, lfm-350m, nextera) or any raw
-Hub id / local directory; the default set and its order are the PPL bench's (BERT,
-ELECTRA, DeBERTa, ModernBERT, NeoBERT, LFM2.5, NexteraBERT), so a model keeps its colour
-and marker across the two figures. One alias differs on purpose: ``electra`` here is
-``electra-base-discriminator``, the 110M encoder people actually deploy. The PPL bench
-has to use the *generator* because only that half has a trained MLM head, but it is a
-34M model (hidden 256) and timing it under the name "ELECTRA-base" would flatter it by
-3x; ``electra-generator`` is still available. Baselines are loaded as bare encoders through
+Models. ``--models`` takes short aliases (bert, electra, deberta, modernbert, neobert,
+lfm, nextera) or any raw Hub id / local directory; the default is all seven (BERT,
+ELECTRA, DeBERTa, ModernBERT, NeoBERT, LFM2.5, NexteraBERT). ``electra`` is
+``electra-base-discriminator``, the 110M encoder people actually deploy, and ``deberta``
+is DeBERTa-base (v1). Baselines are loaded as bare encoders through
 ``hf_baselines.load_hf_encoder`` (NeoBERT's xformers stand-in and RoPE-table repair,
 LFM's prefix repair). Speed does not depend on the weights, so NexteraBERT defaults to
-an untrained ``--preset``; ``--nextera_path`` times a trained backbone's config instead,
-and ``nextera:<preset>`` adds further presets as separate lines::
+an untrained ``--preset``; ``--nextera_path`` times a trained backbone's config instead.
 
-    --models modernbert nextera:piano nextera:mezzoforte
-
-No length caps, as in the PPL bench: **every model is timed at every requested
-length**, and ``max_position_embeddings`` is never used to skip one. RoPE models
-(ModernBERT 8192, NeoBERT 4096 -- its baked RoPE table is re-sized to the sweep) and
-DeBERTa's relative attention simply run longer. BERT / ELECTRA / RoBERTa look positions
-up in a learned table of 512, and past its end a CUDA lookup is a device-side assert
-that kills the whole sweep, so ``--extend_positions copy`` (default) tiles the table as
-Longformer does -- the compute at a given length is identical to a natively longer
-table, so the timing is fair -- and those points are marked ``[e]``. Only an explicit
-``--extend_positions none`` brings the cap back (those lengths are then skipped). What
-does end a line early is memory, below.
+No length caps: **every model is timed at every requested length**, and
+``max_position_embeddings`` is never used to skip one. RoPE models (ModernBERT 8192,
+NeoBERT 4096 -- its baked RoPE table is re-sized to the sweep) and DeBERTa's relative
+attention simply run longer. BERT / ELECTRA look positions up in a learned table of
+512, and past its end a CUDA lookup is a device-side assert that kills the whole sweep,
+so the table is tiled as Longformer does -- the compute at a given length is identical
+to a natively longer table, so the timing is fair -- and those points are marked
+``[e]``. What does end a line early is memory, below.
 
 Attention backend. transformers >= 5 loads every baseline with ``sdpa`` unless told
 otherwise -- ModernBERT no longer switches itself to FlashAttention. SDPA never
@@ -151,7 +133,7 @@ Examples
     python src/nexterabert/model_speedbench.py
 
     # quick CPU smoke test
-    python src/nexterabert/model_speedbench.py --models bert nextera:pianissimo \
+    python src/nexterabert/model_speedbench.py --models bert nextera --preset pianissimo \
         --seq_lengths 128 256 --runs 5 --warmup 1 --compile none
 """
 
@@ -183,10 +165,9 @@ from nexterabert.loading import load_backbone_state  # noqa: E402
 from nexterabert.model_pplbench import (  # noqa: E402
     MODEL_ALIASES,
     NEXTERA_NAME,
+    _position_embedding_module,
     display_name as _ppl_display_name,
-    extend_position_embeddings,
     hf_max_len,
-    make_deberta_autocast_safe,
     resolve_device,
     resolve_model,
     series_style,
@@ -205,23 +186,21 @@ import torch._dynamo  # noqa: E402
 # ==============================
 # 設定
 # ==============================
-# Same set and order as model_pplbench.DEFAULT_MODELS: series_style() is indexed by
-# position, so this is what gives a model the same colour in both figures.
 DEFAULT_MODELS = ["bert", "electra", "deberta", "modernbert", "neobert", "lfm",
                   "nextera"]
 
-# Where the speed bench deliberately departs from the PPL bench's registry. The PPL
-# bench needs ELECTRA's generator (the only half with an MLM head); for latency the
-# subject is the discriminator -- the BERT-base-sized encoder that gets fine-tuned.
+# The speed comparison adds three short-context encoders to the PPL bench's registry
+# (modernbert / neobert / lfm / nextera). For ELECTRA the subject is the
+# discriminator -- the BERT-base-sized encoder that gets fine-tuned.
 SPEED_ALIASES = {
+    "bert": "google-bert/bert-base-uncased",
     "electra": "google/electra-base-discriminator",
-    "electra-generator": "google/electra-base-generator",
+    "deberta": "microsoft/deberta-base",
 }
-# The PPL bench labels the RTD checkpoints "(untrained MLM head)", which is a warning
-# about perplexity and means nothing on a latency plot.
 SPEED_DISPLAY_NAMES = {
+    "google-bert/bert-base-uncased": "BERT-base",
     "google/electra-base-discriminator": "ELECTRA-base",
-    "microsoft/deberta-v3-base": "DeBERTa-v3-base",
+    "microsoft/deberta-base": "DeBERTa-base",
 }
 
 
@@ -235,27 +214,15 @@ DEFAULT_RUNS = 5        # forwards per set
 DEFAULT_ROUNDS = 5      # sets per (model, length), one per pass over the models
 DEFAULT_WARMUP = 5
 
-NEXTERA_PRESET_PREFIX = "nextera:"
-
 
 def is_nextera(name):
-    return name == NEXTERA_NAME or name.startswith("NexteraBERT-")
+    return name == NEXTERA_NAME
 
 
-def resolve_speed_model(name, optibert=None):
-    """``model_pplbench.resolve_model`` plus ``nextera:<preset>``.
-
-    Returns ``(model_id, preset)``; ``preset`` is only set for the explicit-preset form,
-    which always builds an untrained model of that size."""
-    if name.lower().startswith(NEXTERA_PRESET_PREFIX):
-        preset = name[len(NEXTERA_PRESET_PREFIX):].lower()
-        if preset not in PRESET_NAMES:
-            raise SystemExit(f"[speed] unknown preset {preset!r}; choose one of "
-                             f"{', '.join(PRESET_NAMES)}")
-        return f"NexteraBERT-{preset} (Ours)", preset
-    if name.lower() in SPEED_ALIASES:
-        return SPEED_ALIASES[name.lower()], None
-    return resolve_model(name, optibert), None
+def resolve_speed_model(name):
+    """A short alias -> its Hub id (or NexteraBERT's line name); anything else is
+    passed through untouched."""
+    return SPEED_ALIASES.get(name.lower()) or resolve_model(name)
 
 
 # ==============================
@@ -342,6 +309,91 @@ def load_nextera_encoder(path, preset, tokenizer_name, device):
     return model.to(device).eval(), config.vocab_size, None, False, None
 
 
+def extend_position_embeddings(model, target_len):
+    """Grow a learned absolute position table so the model can run at ``target_len``.
+
+    BERT and ELECTRA index a fixed table and raise the moment a sequence exceeds it —
+    there is no extrapolation to be had, because position is a lookup. The table can
+    be grown, though, and that is standard practice: Longformer builds its
+    4096-position embedding by *copying* RoBERTa's 512 positions repeatedly, and so
+    does this (tile the trained block). It is not the released model, so the caller
+    marks these points as extended.
+
+    Returns the new table size, or 0 if nothing needed doing. Modifies the model in
+    place, including the ``position_ids`` / ``token_type_ids`` buffers that are sized
+    from the old maximum.
+    """
+    name, emb_mod = _position_embedding_module(model)
+    if emb_mod is None:
+        return 0
+    old = emb_mod.position_embeddings
+    n_old, dim = old.weight.shape
+    pad = old.padding_idx
+    # RoBERTa-style tables number real positions from padding_idx + 1, so the first
+    # `offset` rows are not usable positions and must be carried over untouched.
+    offset = (pad + 1) if pad is not None else 0
+    usable = n_old - offset
+    if usable <= 0 or usable >= target_len:
+        return 0
+
+    w = old.weight.data
+    body = w[offset:]
+    new_body = body.repeat(-(-target_len // usable), 1)[:target_len]
+
+    n_new = target_len + offset
+    new_emb = torch.nn.Embedding(n_new, dim, padding_idx=pad)
+    new_emb.weight.data = torch.cat([w[:offset], new_body], 0).clone()
+    emb_mod.position_embeddings = new_emb.to(w.device)
+    model.config.max_position_embeddings = n_new
+
+    # These buffers are built from the old maximum; leaving them stale is what raises
+    # "expanded size of the tensor (1024) must match the existing size (512)".
+    for buf in ("position_ids", "token_type_ids"):
+        cur = getattr(emb_mod, buf, None)
+        if cur is None:
+            continue
+        if buf == "position_ids":
+            new_buf = torch.arange(n_new, device=cur.device).expand((1, -1))
+        else:
+            new_buf = torch.zeros((1, n_new), dtype=cur.dtype, device=cur.device)
+        emb_mod.register_buffer(buf, new_buf, persistent=False)
+
+    print(f"[speed]   extended {name}.position_embeddings {usable} -> {target_len} "
+          f"(copy); this model has no way to extrapolate a position lookup, so the "
+          f"extra rows are tiled copies of the trained table -- points past {usable} "
+          f"are marked [e].")
+    return n_new
+
+
+def make_deberta_autocast_safe(model, config, autocast_dtype):
+    """Let DeBERTa (v1) run under half-precision autocast. Returns the params touched.
+
+    Its attention keeps the query/value biases as bare fp32 parameters and adds them
+    to the (autocast, half) projection, which promotes ``query_layer`` back to fp32;
+    the mask fill then uses ``torch.finfo(query_layer.dtype).min`` -- the *fp32*
+    minimum -- on half-precision scores, and ``-3.40e38`` does not fit bf16 (max
+    3.39e38): "value cannot be converted to type c10::BFloat16 without overflow", at
+    every sequence length. Storing those two biases in the autocast dtype keeps
+    ``query_layer`` in half precision, which is all autocast would do to them had they
+    been ``nn.Linear`` biases (as they are in DeBERTa-v2/v3, which does not have the
+    problem) -- the matmul they feed runs in half precision either way."""
+    if autocast_dtype is None or autocast_dtype == torch.float32 or \
+            getattr(config, "model_type", None) != "deberta":
+        return 0
+    touched = 0
+    for module in model.modules():
+        for attr in ("q_bias", "v_bias"):
+            bias = getattr(module, attr, None)
+            if isinstance(bias, torch.nn.Parameter) and bias.is_floating_point():
+                bias.data = bias.data.to(autocast_dtype)
+                touched += 1
+    if touched:
+        print(f"[speed] DeBERTa: stored {touched} q/v attention biases in "
+              f"{autocast_dtype} so the model runs under autocast (its fp32 mask-fill "
+              f"constant overflows half precision otherwise).")
+    return touched
+
+
 def make_deberta_compile_friendly(config):
     """Let DeBERTa (v1) compile into ONE graph, like every other model here.
 
@@ -405,12 +457,14 @@ def uses_flash_attention(model):
     return isinstance(backend, str) and "flash" in backend
 
 
-def load_hf_speed_encoder(name, device, target_len, extend_positions,
-                          autocast_dtype=None, attn_implementation=None):
+def load_hf_speed_encoder(name, device, target_len, autocast_dtype=None,
+                          attn_implementation=None):
     """Bare 🤗 encoder + the positional-cap facts the sweep needs.
 
-    Returns ``(model, vocab_size, max_len, hard_cap, extended_from)`` with the same
-    meaning as in ``model_pplbench.load_hf_masked_lm``."""
+    Returns ``(model, vocab_size, max_len, hard_cap, extended_from)``: ``max_len`` is
+    the positional cap (None if uncapped), ``hard_cap`` whether exceeding it is
+    impossible (a learned table that could not be extended), and ``extended_from`` the
+    size of a learned table that was tiled to reach ``target_len``."""
     auto = attn_implementation == "auto"
     attn_implementation = requested_attention(attn_implementation)
     try:
@@ -430,7 +484,7 @@ def load_hf_speed_encoder(name, device, target_len, extend_positions,
     print(f"[speed] {name}: attention backend = "
           f"{getattr(model.config, '_attn_implementation', None)!r}")
     model = model.to(device).eval()
-    make_deberta_autocast_safe(model, config, autocast_dtype, tag="speed")
+    make_deberta_autocast_safe(model, config, autocast_dtype)
     make_deberta_compile_friendly(config)
     max_len = hf_max_len(config)
     # Only a learned table that is actually there can be indexed out of range.
@@ -439,12 +493,12 @@ def load_hf_speed_encoder(name, device, target_len, extend_positions,
     if hard_cap and (max_len is None or real_cap < max_len):
         max_len = real_cap
     extended_from = None
-    if hard_cap and extend_positions != "none" and max_len and target_len > max_len:
-        if extend_position_embeddings(model, int(target_len), extend_positions):
+    if hard_cap and max_len and target_len > max_len:
+        if extend_position_embeddings(model, int(target_len)):
             extended_from, hard_cap = max_len, False
     if hard_cap:
         print(f"[speed] {name}: fixed position table of {max_len}; longer lengths are "
-              f"skipped (--extend_positions none).")
+              f"skipped.")
     return model, int(config.vocab_size), max_len, hard_cap, extended_from
 
 
@@ -464,10 +518,8 @@ def _free(device):
 
 
 def batch_size_for(args, seq_len):
-    """Sequences per batch at ``seq_len``: a fixed ``--batch_size`` when given, else
-    whatever keeps the batch at about ``--batch_tokens`` tokens."""
-    if args.batch_size:
-        return args.batch_size
+    """Sequences per batch at ``seq_len``: whatever keeps the batch at about
+    ``--batch_tokens`` tokens."""
     return max(1, min(args.max_batch_size, args.batch_tokens // seq_len))
 
 
@@ -516,15 +568,14 @@ def cuda_capacity():
     return free + torch.cuda.memory_reserved()
 
 
-def time_forward(step, runs, warmup, device, sync_each_run=False, after_warmup=None):
+def time_forward(step, runs, warmup, device, after_warmup=None):
     """``runs`` individually-timed forwards, in seconds, after ``warmup`` untimed ones.
 
     On CUDA the forwards are queued back to back and synchronised once at the end, as
     the original single-block timing did; each one is merely bracketed by its own pair
     of events. Start event i lands on the stream directly behind end event i-1, so the
     samples tile the block (any GPU idle gap waiting on the CPU falls into the next
-    sample) and their mean equals the old ``elapsed / runs``. ``sync_each_run`` instead
-    drains the GPU after every forward: isolated-request latency, CPU launch included."""
+    sample) and their mean equals the old ``elapsed / runs``."""
     for _ in range(warmup):
         step()
     if after_warmup is not None:
@@ -538,8 +589,6 @@ def time_forward(step, runs, warmup, device, sync_each_run=False, after_warmup=N
             start.record()
             step()
             end.record()
-            if sync_each_run:
-                torch.cuda.synchronize()
             events.append((start, end))
         torch.cuda.synchronize()
         return [start.elapsed_time(end) / 1000.0 for start, end in events]
@@ -589,7 +638,7 @@ def new_result(args, cached=None, cached_meta=None):
             "error": meta.get("load_error")}
 
 
-def benchmark_model(name, preset, args, device, autocast_ctx, res, round_idx):
+def benchmark_model(name, args, device, autocast_ctx, res, round_idx):
     """One round for one model: load it, time ONE set at every length that does not
     have this round's set yet, free it. Appends to ``res`` in place."""
     points = res["points"]
@@ -616,11 +665,10 @@ def benchmark_model(name, preset, args, device, autocast_ctx, res, round_idx):
     try:
         if is_nextera(name):
             model, vocab, max_len, hard_cap, extended_from = load_nextera_encoder(
-                None if preset else args.nextera_path, preset or args.preset,
-                args.tokenizer, device)
+                args.nextera_path, args.preset, args.tokenizer, device)
         else:
             model, vocab, max_len, hard_cap, extended_from = load_hf_speed_encoder(
-                name, device, max(args.seq_lengths), args.extend_positions,
+                name, device, max(args.seq_lengths),
                 getattr(autocast_ctx, "fast_dtype", None),
                 None if args.attn_implementation == "default"
                 else args.attn_implementation)
@@ -667,7 +715,7 @@ def benchmark_model(name, preset, args, device, autocast_ctx, res, round_idx):
             # Out-of-range position lookup = device-side assert on CUDA, which takes
             # the rest of the sweep down with it. Never attempt it.
             print(f"{name} | seq_len={seq_len} | skip (position table stops at "
-                  f"{max_len}; use --extend_positions copy)")
+                  f"{max_len})")
             pt["skip_reason"] = "position_cap"
             continue
         if oom_at is not None and seq_len >= oom_at:
@@ -724,8 +772,7 @@ def benchmark_model(name, preset, args, device, autocast_ctx, res, round_idx):
             torch.cuda.reset_peak_memory_stats()
         try:
             with torch.inference_mode(), autocast_ctx:
-                times = time_forward(step, args.runs, args.warmup, device,
-                                     args.sync_each_run, after_warmup)
+                times = time_forward(step, args.runs, args.warmup, device, after_warmup)
             if device == "cuda":
                 steady_mem = torch.cuda.max_memory_allocated()
                 # The OOM prediction keeps using the overall peak: a length has to get
@@ -777,7 +824,7 @@ def host_cpu():
     """CPU model and logical core count of the host, for the record.
 
     The GPU does the timed work, but the host still shows through wherever a model is
-    launch-bound (eager graph segments, --sync_each_run, --compile none): that part
+    launch-bound (eager graph segments, --compile none): that part
     scales with single-thread speed. Results taken on two hosts should be told apart,
     so the JSON says which one it was. Not part of the resume key -- swapping the CPU
     does not invalidate GPU-bound points."""
@@ -808,7 +855,10 @@ def device_name(device):
 # it matches -- including the device it was measured on.
 def measurement_settings(args, device):
     return {
-        "batch_size": args.batch_size,          # null = follow --batch_tokens
+        # the batch always follows --batch_tokens, the forwards are always queued back
+        # to back and learned position tables are always tiled; recorded so a file
+        # measured otherwise is not reused
+        "batch_size": None,
         "batch_tokens": args.batch_tokens,
         "max_batch_size": args.max_batch_size,
         # --rounds is deliberately absent: more rounds only ADD sets to a record.
@@ -817,10 +867,10 @@ def measurement_settings(args, device):
         "confidence": args.confidence,
         "dtype": args.dtype,
         "compile": args.compile,
-        "sync_each_run": args.sync_each_run,
+        "sync_each_run": False,
         "attn_implementation": args.attn_implementation,
         "attention_mask": args.attention_mask,
-        "extend_positions": args.extend_positions,
+        "extend_positions": "copy",
         "device": device,
         "device_name": device_name(device),
         "torch": torch.__version__,
@@ -853,8 +903,8 @@ def load_cached_results(path, args, device):
     for entry in payload.get("models", []):
         # The NexteraBERT line is only the same subject if it was built the same way.
         if entry.get("is_nextera") and (
-                entry.get("nextera_path") != nextera_path_of(entry["id"], args)
-                or entry.get("preset") != entry_preset(entry["id"], args)):
+                entry.get("nextera_path") != args.nextera_path
+                or entry.get("preset") != args.preset):
             continue
         # 'auto' is a per-machine decision: a baseline recorded while flash-attn was
         # missing (-> sdpa) must not be reused once FlashAttention can be requested,
@@ -881,17 +931,6 @@ def load_cached_results(path, args, device):
         print(f"[speed] reusing {total} recorded set(s) from {path} "
               f"({len(cached)} model(s)); pass --refresh to re-measure them.")
     return cached, meta
-
-
-def entry_preset(name, args):
-    if name.startswith("NexteraBERT-"):
-        return name[len("NexteraBERT-"):].split(" ")[0]
-    return args.preset
-
-
-def nextera_path_of(name, args):
-    """Only the plain 'nextera' entry reads --nextera_path; 'nextera:<preset>' never."""
-    return args.nextera_path if name == NEXTERA_NAME else None
 
 
 def _json_safe(x):
@@ -944,8 +983,8 @@ def write_json(path, args, results, device, carry=None):
             "by_seq_len": [],
         }
         if is_nextera(name):
-            entry["nextera_path"] = nextera_path_of(name, args)
-            entry["preset"] = entry_preset(name, args)
+            entry["nextera_path"] = args.nextera_path
+            entry["preset"] = args.preset
         for seq_len in args.seq_lengths:
             pt = res["points"][seq_len]
             sm = summarize_point(pt, args.confidence)
@@ -992,15 +1031,6 @@ def write_json(path, args, results, device, carry=None):
 # ==============================
 # プロット
 # ==============================
-def _style(index, name, n_nextera_seen):
-    if is_nextera(name):
-        # Every NexteraBERT line is the thick black one; presets differ by dash.
-        style = dict(series_style(index, NEXTERA_NAME))
-        style["linestyle"] = ["-", "--", ":", "-."][n_nextera_seen % 4]
-        return style
-    return series_style(index, name)
-
-
 def _label(name, res):
     params = res.get("params")
     tags = [f"{params / 1e6:.0f}M"] if params else []
@@ -1011,17 +1041,13 @@ def _label(name, res):
 
 
 def batch_note(args):
-    if args.batch_size:
-        return f"batch={args.batch_size}"
     return f"batch={args.batch_tokens} tokens / length (max {args.max_batch_size})"
 
 
 def _write_figure(path, results, args, *, throughput):
     fig, ax = plt.subplots(figsize=(9, 5.5))
-    n_nextera = 0
     for i, (name, res) in enumerate(results.items()):
-        style = _style(i, name, n_nextera)
-        n_nextera += is_nextera(name)
+        style = series_style(i, name)
         pts = [(L, summarize_point(res["points"][L], args.confidence))
                for L in args.seq_lengths]
         pts = [(L, p) for L, p in pts if math.isfinite(p["mean"])]
@@ -1064,8 +1090,7 @@ def _write_figure(path, results, args, *, throughput):
          else "Model Speed vs Sequence Length")
         + f"\n{batch_note(args)}, {args.rounds} rounds x {args.runs} runs, "
           f"bars/band = {args.confidence * 100:g}% CI over rounds"
-          f"\ncompile={args.compile}, {args.dtype}"
-          f"{', synchronised per run' if args.sync_each_run else ''}",
+          f"\ncompile={args.compile}, {args.dtype}",
         fontsize=10)
     ax.grid(alpha=0.3, which="both" if args.log_y else "major")
     ax.legend(fontsize=9, ncol=2 if len(results) > 4 else 1, framealpha=0.9)
@@ -1088,15 +1113,11 @@ def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--models", nargs="+", default=DEFAULT_MODELS,
-                   help=f"models to time, as short aliases, 'nextera:<preset>', or raw "
-                        f"Hub ids / local dirs. Aliases: "
+                   help=f"models to time, as short aliases or raw Hub ids / local "
+                        f"dirs. Aliases: "
                         f"{', '.join(sorted(set(MODEL_ALIASES) | set(SPEED_ALIASES)))} "
-                        f"('electra' is the 110M discriminator here, not the PPL "
-                        f"bench's 34M generator). "
+                        f"('electra' is the 110M discriminator). "
                         f"Default: {' '.join(DEFAULT_MODELS)}")
-    p.add_argument("--optibert", default=None,
-                   help="Hub id or local directory to time as the 'optibert' entry "
-                        "(the paper released a recipe, not weights).")
     p.add_argument("--nextera_path", default=None,
                    help="NexteraBERT backbone directory whose config (and weights) the "
                         "'nextera' entry uses. Default: an untrained --preset, since "
@@ -1114,10 +1135,6 @@ def parse_args():
                         f"(default {DEFAULT_BATCH_TOKENS} = 64 x 1024 ... 1 x 65536)")
     p.add_argument("--max_batch_size", type=int, default=128,
                    help="upper clamp on the derived batch size (default 128)")
-    p.add_argument("--batch_size", type=int, default=None,
-                   help="fixed batch size at every length instead of the token budget "
-                        "(the old behaviour was 2). Under-fills the device at short "
-                        "lengths, so tokens/s drops there.")
     p.add_argument("--runs", type=int, default=DEFAULT_RUNS,
                    help=f"individually-timed forwards in one set, queued back to back "
                         f"(default {DEFAULT_RUNS})")
@@ -1138,13 +1155,6 @@ def parse_args():
                         "what helps a launch-bound model at short lengths; "
                         "max-autotune favours long, compute-bound sequences; none = "
                         "eager.")
-    p.add_argument("--sync_each_run", action="store_true",
-                   help="synchronise after every forward: isolated-request latency, "
-                        "including the CPU launch cost that back-to-back queueing "
-                        "hides. Off by default -- the forwards are queued back to back "
-                        "and synchronised once, as the original script did. Penalises "
-                        "launch-bound models at short lengths; not comparable with "
-                        "numbers taken without it.")
     p.add_argument("--dtype", default="bf16", choices=["bf16", "fp16", "fp32"],
                    help="autocast dtype on CUDA (CPU / MPS run without autocast)")
     p.add_argument("--no_attention_mask", dest="attention_mask", action="store_false",
@@ -1173,13 +1183,6 @@ def parse_args():
                         "data-dependent graph break). A model that cannot do the "
                         "requested backend falls back to its default, and the JSON "
                         "records what each model actually ran on.")
-    p.add_argument("--extend_positions", default="copy",
-                   choices=["copy", "interpolate", "none"],
-                   help="how a model with a LEARNED position table (BERT, ELECTRA, "
-                        "RoBERTa) reaches lengths past it: tile the table (copy, the "
-                        "default), stretch it, or skip those lengths (none). The "
-                        "compute is that of a natively longer table; points are "
-                        "marked [e].")
     p.add_argument("--oom_margin", type=float, default=0.9,
                    help="CUDA only. Skip a length (and every longer one for that "
                         "model) without attempting it when the peak memory "
@@ -1201,9 +1204,8 @@ def parse_args():
                         "--refresh for everything, or '--refresh deberta lfm' for "
                         "just those models (same aliases / ids as --models)")
     args = p.parse_args()
-    if args.batch_tokens < 1 or args.max_batch_size < 1 or \
-            (args.batch_size is not None and args.batch_size < 1):
-        p.error("--batch_tokens, --max_batch_size and --batch_size must be positive")
+    if args.batch_tokens < 1 or args.max_batch_size < 1:
+        p.error("--batch_tokens and --max_batch_size must be positive")
     if args.runs < 1 or args.rounds < 1:
         p.error("--runs and --rounds must be at least 1")
     if args.rounds == 1 and args.runs < 2:
@@ -1217,12 +1219,11 @@ def main():
     args = parse_args()
     torch.manual_seed(args.seed)
 
-    presets, models = {}, []
+    models = []
     for raw in args.models:
-        name, preset = resolve_speed_model(raw, args.optibert)
+        name = resolve_speed_model(raw)
         if name not in models:      # two aliases can resolve to the same id
             models.append(name)
-            presets[name] = preset
 
     if args.json_output is None:
         args.json_output = os.path.splitext(args.output)[0] + ".json"
@@ -1239,14 +1240,13 @@ def main():
     print(f"[speed] device={device} ({device_name(device)})  models={models}  "
           f"{batch_note(args)}  rounds={args.rounds} x runs={args.runs}  "
           f"warmup={args.warmup}  "
-          f"compile={args.compile}  "
-          f"sync_each_run={args.sync_each_run}")
+          f"compile={args.compile}")
 
     refresh_all = args.refresh is not None and not args.refresh
     cached, cached_meta = ({}, {}) if (refresh_all or not use_json) else \
         load_cached_results(args.json_output, args, device)
     for raw in args.refresh or []:
-        name = resolve_speed_model(raw, args.optibert)[0]
+        name = resolve_speed_model(raw)
         if cached.pop(name, None) is not None:
             print(f"[speed] --refresh: discarding the recorded sets of "
                   f"{display_name(name)}")
@@ -1262,8 +1262,7 @@ def main():
         for name in models:
             print(f"\n=== {display_name(name)}  [{name}]  "
                   f"(round {round_idx + 1}/{args.rounds}) ===")
-            benchmark_model(name, presets[name], args, device, autocast_ctx,
-                            results[name], round_idx)
+            benchmark_model(name, args, device, autocast_ctx, results[name], round_idx)
             # Rewritten after every model so an interrupted sweep resumes from here.
             if use_json:
                 write_json(args.json_output, args, results, device, cached_meta)

@@ -1,41 +1,19 @@
 #!/usr/bin/env python
-"""Contrastive fine-tuning: the stage MTEB and BEIR numbers are measured after.
+"""Contrastive fine-tuning: the stage MTEB numbers are measured after.
 
-Both benchmarks score one vector per text, and an MLM/RTD backbone was never
-trained to place related texts near each other -- so published encoder numbers on
-either come from a model that first learned to embed. This script runs that stage,
-under whichever prior-work protocol matches the benchmark being reported:
+MTEB scores one vector per text, and an MLM backbone was never trained to place
+related texts near each other -- so published encoder numbers on it come from a
+model that first learned to embed. This script runs that stage under the protocol
+of the MTEB comparison:
 
   --protocol mteb-nli  (default)  OptiBERT, Dervishi et al. EMNLP 2025, App. D.2
       Attentive pooling head + supervised-SimCSE InfoNCE on MNLI+SNLI triplets,
       3 epochs (Gao et al., 2021). Their Table 5 MTEB(eng, v2) scores follow this.
           -> feed the result to scripts/evaluate_mteb.py
 
-  --protocol retrieval-msmarco    ModernBERT, Warner et al. 2024, 3.1.2 + App. E.2
-      Mean pooling (no extra head) + InfoNCE over MS MARCO query/passage pairs
-      with mined hard negatives, 1.25M samples, batch 16, 5% warmup, lr swept over
-      [1e-5 .. 1e-4] (8e-5 chosen for ModernBERT-base, 5e-5 for BERT-base). Their
-      Table 7 BEIR nDCG@10 -- BERT-base 38.9, ModernBERT-base 41.6 -- follows this.
-          -> feed the result to scripts/evaluate_retrieval.py
-
-  --protocol retrieval-mldr       ModernBERT, Warner et al. 2024, 3.1.3 "Single Vector - In Domain"
-      The MS MARCO-tuned model (above) is further fine-tuned on the English MLDR
-      training split (Shitao/MLDR, long documents: max_len 8192), then scored on
-      the MLDR test split. Their Table 1 MLDR_ID column follows this. The paper
-      gives no hyperparameters for this stage: one epoch at the DPR learning
-      rate, batch 8, is the assumption made here (all overridable). Pooling
-      follows the source checkpoint (attentive head if it has one, else mean).
-          -> scripts/evaluate_retrieval.py --tasks MultiLongDocRetrieval --languages eng
-
-    # MTEB
     python scripts/finetune_contrastive.py --model checkpoints/phase2/backbone \
         --output_dir checkpoints/phase2/simcse
     python scripts/evaluate_mteb.py --model checkpoints/phase2/simcse
-
-    # Retrieval (BEIR / NanoBEIR)
-    python scripts/finetune_contrastive.py --protocol retrieval-msmarco \
-        --model checkpoints/phase2/backbone --output_dir checkpoints/phase2/dpr
-    python scripts/evaluate_retrieval.py --model checkpoints/phase2/dpr
 
     # A Hugging Face baseline through the SAME stage, for a like-for-like MTEB row
     python scripts/finetune_contrastive.py --hf_model answerdotai/ModernBERT-base         --output_dir checkpoints/baselines/ModernBERT-base/simcse
@@ -48,31 +26,21 @@ uses the baseline's own tokenizer unless --tokenizer says otherwise. The result
 directory is an ordinary save_pretrained directory plus the repo's markers, and
 both eval scripts open it automatically through --model.
 
-Everything a protocol pins is in PROTOCOLS below and overridable from the CLI. The
-optimiser side both share is `evaluate_glue.py`'s recipe (AdamW betas (0.9, 0.95),
-eps 1e-6, linear decay to zero after warmup, grad clip 1.0, weight decay on
-matrices only, torch-scale), reusing its `build_optimizer` so the no-decay grouping
-and LR ladder stay identical to GLUE fine-tuning. As in this repo's GLUE recipe,
-layerwise LR decay is on by default (`--llrd 0.9`): the upper layers retain the
-protocol LR while lower pretrained layers move progressively less. This is an
-extra regulariser rather than part of either published protocol; `--no_llrd`
-restores their flat LR exactly. A Hugging Face baseline gets the same default,
-with its layer names mapped onto the same ladder.
+Everything the protocol pins is in PROTOCOLS below and overridable from the CLI.
+The optimiser side is `evaluate_glue.py`'s recipe (AdamW betas (0.9, 0.95), eps
+1e-6, linear decay to zero after warmup, grad clip 1.0, weight decay on matrices
+only, torch-scale), reusing its `build_optimizer` so the no-decay grouping and LR
+ladder stay identical to GLUE fine-tuning. As in this repo's GLUE recipe, layerwise
+LR decay is on by default (`--llrd 0.9`): the upper layers retain the protocol LR
+while lower pretrained layers move progressively less. This is an extra
+regulariser rather than part of the published protocol; `--no_llrd` restores its
+flat LR exactly (the other side of the LLRD comparison). A Hugging Face baseline
+gets the same default, with its layer names mapped onto the same ladder.
 
 Batch size is part of the objective, not just the memory knob: InfoNCE negatives
 only come from tensors sharing a forward pass, so gradient accumulation cannot
 substitute for it (see info_nce_loss). For the same reason DDP is deliberately not
 supported -- per-rank batches would quietly weaken the loss instead of scaling it.
-ModernBERT's batch 16 is small for a contrastive objective (31 negatives per
-anchor, against 1023 for the NLI protocol's 512); it is reproduced here because it
-is what the paper states, but raising it is usually the first thing to try if the
-retrieval numbers disappoint. Its lr was swept AT batch 16, so re-sweep --lr
-alongside, and record that the run deviates from the published protocol.
-
-Asymmetric protocols pad the anchors apart from the documents (--split_views, on
-for retrieval-msmarco): sentence-transformers tokenises each dataset column in its
-own forward pass, so this matches the reference implementation as well as avoiding
-the padding leak described in TripletCollator.
 """
 
 from __future__ import annotations
@@ -123,38 +91,15 @@ from nexterabert.simcse import (  # noqa: E402
 
 DEFAULT_TOKENIZER = "answerdotai/ModernBERT-base"
 
-# Per-protocol defaults. `None` for a CLI flag means "take the value here"; every
+# Protocol defaults. `None` for a CLI flag means "take the value here"; every
 # one of them is overridable.
 PROTOCOLS = {
     # OptiBERT App. D.2 -> supervised SimCSE (Gao et al., 2021, Sec. 6.1) for the
     # constants the appendix delegates rather than states.
     "mteb-nli": {
-        "dataset": "nli", "pooling": "attentive", "epochs": 3, "batch_size": 512,
+        "pooling": "attentive", "epochs": 3, "batch_size": 512,
         "max_len": 64, "lr": 5e-5, "warmup_pct": 0.06, "max_samples": 0,
-        "eval_every": 250, "split_views": False,
-    },
-    # ModernBERT 3.1.2 ("1.25M samples ... batch size of 16", 5% warmup, via
-    # sentence-transformers, whose MultipleNegativesRankingLoss is InfoNCE at
-    # scale 20 = temperature 0.05 with mean pooling) + App. E.2 (lr sweep).
-    "retrieval-msmarco": {
-        "dataset": "msmarco", "pooling": "mean", "epochs": 1, "batch_size": 16,
-        "max_len": 256, "lr": 8e-5, "warmup_pct": 0.05, "max_samples": 1_250_000,
-        # queries and passages are padded apart: see TripletCollator
-        "split_views": True,
-        # ModernBERT selects by an lr sweep scored on NFCorpus/SciFact/TREC-COVID/
-        # FiQA, not by a mid-training metric, so nothing is evaluated inline.
-        "eval_every": 0,
-    },
-    # ModernBERT 3.1.3, single-vector in-domain: "Models trained on MS-MARCO are
-    # further fine-tuned on long-context MLDR training set before being
-    # evaluated." Start it from the retrieval-msmarco output, not the raw
-    # backbone. Batch/epochs/lr are this repo's assumptions (see module docstring).
-    # pooling "auto" = keep whatever the source checkpoint trained: the attentive
-    # head when --model carries pooling_head.pt (an mteb-nli run), else mean.
-    "retrieval-mldr": {
-        "dataset": "mldr", "pooling": "auto", "epochs": 1, "batch_size": 8,
-        "max_len": 8192, "lr": 8e-5, "warmup_pct": 0.05, "max_samples": 0,
-        "split_views": True, "eval_every": 0,
+        "eval_every": 250,
     },
 }
 
@@ -162,23 +107,13 @@ PROTOCOLS = {
 # (-1 marks SNLI's examples with no gold label, which are dropped).
 ENTAILMENT, CONTRADICTION = 0, 2
 NLI_SOURCES = ("nyu-mll/multi_nli", "stanfordnlp/snli")
-# MS MARCO with hard negatives mined by msmarco-distilbert-base-tas-b, in the
-# sentence-transformers "Embedding Model Datasets" collection: (query, positive,
-# negative) columns, which is the shape ModernBERT's ST training consumes.
-MSMARCO_DATASET = ("sentence-transformers/msmarco-msmarco-distilbert-base-tas-b",
-                   "triplet")
-# MLDR (Chen et al., 2024): the English train split carries, per query, a list of
-# positive and a list of (BM25-mined) negative long documents. The Hub repo is a
-# loading-script dataset (MLDR.py), which datasets >= 4 refuses to run, so the
-# raw gzipped JSONL is fetched and streamed directly (1.25 GB; long documents).
-MLDR_DATASET = ("Shitao/MLDR", "mldr-v1.0-en/train.jsonl.gz")
 
 
 # ---------------------------------------------------------------------------
 # Data: (anchor, positive, hard negative) triplets
 # ---------------------------------------------------------------------------
 
-def build_nli_triplets(max_samples: int = 0) -> list[tuple[str, str, str]]:
+def build_nli_triplets() -> list[tuple[str, str, str]]:
     """Group NLI rows into SimCSE's supervised triplets.
 
     A premise that carries both an entailment and a contradiction hypothesis
@@ -210,92 +145,15 @@ def build_nli_triplets(max_samples: int = 0) -> list[tuple[str, str, str]]:
     return triplets
 
 
-def build_msmarco_triplets(max_samples: int = 0) -> list[tuple[str, str, str]]:
-    """(query, positive passage, mined hard negative) rows from MS MARCO."""
-    from datasets import load_dataset
-
-    name, config = MSMARCO_DATASET
-    ds = load_dataset(name, config)["train"]
-    if max_samples and max_samples < len(ds):
-        # a fixed-seed shuffle, so a capped run is a random sample of the corpus
-        # rather than its first N rows (which are ordered by query id)
-        ds = ds.shuffle(seed=42).select(range(max_samples))
-    print(f"[data] {name} [{config}]: {len(ds)} triplets")
-    return list(zip(ds["query"], ds["positive"], ds["negative"]))
-
-
-def build_mldr_triplets(max_samples: int = 0, path: str | None = None,
-                        negatives: str = "one") -> list[tuple[str, str, str]]:
-    """(query, positive long document, mined negative long document) from MLDR-en.
-
-    ``negatives="one"`` samples one (positive, negative) pair per query; ``"all"``
-    pairs every mined negative of a query with a sampled positive -- MLDR-en TRAIN
-    carries 20 BM25 negatives per query (dev: 7), so this is ~20x the triplets;
-    an integer ``k`` samples ``k`` of them per query. Triplets of one query stay
-    adjacent, so a caller can hold out whole queries.
-
-    ``path`` overrides the Hub download with a local ``.jsonl[.gz]`` in the same
-    record format (``query_id`` / ``query`` / ``positive_passages`` /
-    ``negative_passages``, each passage ``{"docid", "text"}``).
-    """
-    per_query = None                       # None = all, else how many to sample
-    if negatives == "one":
-        per_query = 1
-    elif negatives != "all":
-        try:
-            per_query = int(negatives)
-        except (TypeError, ValueError):
-            raise ValueError(
-                f"negatives must be 'one', 'all' or an integer, got {negatives!r}") from None
-        if per_query < 1:
-            raise ValueError(f"negatives must be >= 1, got {per_query}")
-    import gzip
-    import random
-
-    if path is None:
-        from huggingface_hub import hf_hub_download
-
-        repo, filename = MLDR_DATASET
-        path = hf_hub_download(repo, filename, repo_type="dataset")
-        label = f"{repo} [{filename}]"
-    else:
-        label = path
-
-    rng = random.Random(42)
-    opener = gzip.open if str(path).endswith(".gz") else open
-    triplets, n_rows = [], 0
-    with opener(path, "rt", encoding="utf-8") as f:
-        for line in f:
-            row = json.loads(line)
-            n_rows += 1
-            positives = [p["text"] for p in (row.get("positive_passages") or []) if p.get("text")]
-            negatives = [n["text"] for n in (row.get("negative_passages") or []) if n.get("text")]
-            if not positives or not negatives:
-                continue
-            # sampled (not the first k) so a rerun with a different cap still sees a
-            # random mix; every pair reuses one sampled positive for the query
-            chosen = negatives if per_query is None else rng.sample(
-                negatives, min(per_query, len(negatives)))
-            positive = rng.choice(positives)
-            for neg in chosen:
-                triplets.append((row["query"], positive, neg))
-    if max_samples and max_samples < len(triplets):
-        rng.shuffle(triplets)
-        triplets = triplets[:max_samples]
-    print(f"[data] {label}: {len(triplets)} triplets from {n_rows} queries")
-    return triplets
-
-
-def build_triplets(dataset: str, cache: str | None = None, max_samples: int = 0):
+def build_triplets(cache: str | None = None, max_samples: int = 0):
+    """The NLI triplets, read from / written to ``cache`` when one is given."""
     if cache and Path(cache).exists():
         with open(cache, encoding="utf-8") as f:
             triplets = [tuple(t) for t in json.load(f)]
         print(f"[data] {len(triplets)} triplets from cache {cache}")
         return triplets[:max_samples] if max_samples else triplets
 
-    builder = {"nli": build_nli_triplets, "msmarco": build_msmarco_triplets,
-               "mldr": build_mldr_triplets}[dataset]
-    triplets = builder(max_samples)
+    triplets = build_nli_triplets()
 
     if cache:
         Path(cache).parent.mkdir(parents=True, exist_ok=True)
@@ -317,40 +175,18 @@ class TripletDataset(Dataset):
 
 
 class TripletCollator:
-    """Tokenise a batch of triplets into padded id/mask tensors.
+    """Tokenise a batch of triplets into padded id/mask tensors: one flat (3B, T)
+    batch with the views interleaved (a0, p0, n0, a1, ...), which the embeddings
+    split back out of with a stride-3 slice."""
 
-    ``split_views=False`` (symmetric data, e.g. NLI): one flat (3B, T) batch with
-    the views interleaved (a0, p0, n0, a1, ...), which the embeddings split back
-    out of with a stride-3 slice.
-
-    ``split_views=True`` (asymmetric data, e.g. MS MARCO): the anchors are
-    tokenised separately from the passages, so a ~10-token query is padded among
-    other queries instead of out to a 256-token passage. That matters here beyond
-    wasted compute -- NexteraHRA's conv runs before the mask (see
-    ``nexterabert.mteb_encoder``), so padding leaks into the last real tokens of
-    the shortest text in the batch. Mixing queries and passages in one padded
-    batch therefore trains the query side on contaminated states, while retrieval
-    evaluation (which batches by length) encodes them clean: a train/eval
-    mismatch on exactly the side retrieval is most sensitive to.
-    """
-
-    def __init__(self, tokenizer, max_len, split_views=False):
+    def __init__(self, tokenizer, max_len):
         self.tokenizer, self.max_len = tokenizer, max_len
-        self.split_views = split_views
-
-    def _encode(self, texts):
-        enc = self.tokenizer(texts, padding=True, truncation=True,
-                             max_length=self.max_len, return_tensors="pt")
-        return enc["input_ids"], enc["attention_mask"]
 
     def __call__(self, batch):
-        if not self.split_views:
-            return (self._encode([text for triplet in batch for text in triplet]),)
-        anchors = [triplet[0] for triplet in batch]
-        # positives then negatives: one pass over everything that is a document,
-        # so both sides of the loss see the same padding regime
-        documents = [t[1] for t in batch] + [t[2] for t in batch]
-        return self._encode(anchors), self._encode(documents)
+        enc = self.tokenizer([text for triplet in batch for text in triplet],
+                             padding=True, truncation=True,
+                             max_length=self.max_len, return_tensors="pt")
+        return enc["input_ids"], enc["attention_mask"]
 
 
 # ---------------------------------------------------------------------------
@@ -428,12 +264,10 @@ def train(args):
         print("[info] resuming from an already-trained pooling head")
     model.to(dev)
 
-    triplets = build_triplets(args.dataset, cache=args.triplets_cache,
-                              max_samples=args.max_samples)
+    triplets = build_triplets(cache=args.triplets_cache, max_samples=args.max_samples)
     loader = DataLoader(TripletDataset(triplets), batch_size=args.batch_size,
                         shuffle=True, drop_last=True,
-                        collate_fn=TripletCollator(tokenizer, args.max_len,
-                                                   split_views=args.split_views),
+                        collate_fn=TripletCollator(tokenizer, args.max_len),
                         num_workers=args.num_workers, pin_memory=True)
 
     optimizer, groups = build_optimizer(
@@ -466,7 +300,7 @@ def train(args):
     print(f"[{args.protocol}] {len(triplets)} triplets  pooling={args.pooling}  "
           f"bs={args.batch_size}  epochs={args.epochs}  steps={total_steps}  "
           f"lr={args.lr:.1e}  wd={args.weight_decay}  tau={args.temperature}  "
-          f"max_len={args.max_len}  split_views={args.split_views}  "
+          f"max_len={args.max_len}  "
           f"llrd={args.llrd:g}  warmup={warmup_steps}  dtype={args.dtype}  "
           f"dev={dev.type}")
     n_decayed = sum(g["n_params"] for g in groups if not g["no_decay"])
@@ -483,16 +317,11 @@ def train(args):
     start = time.time()
     model.train()
     for epoch in range(args.epochs):
-        for views in loader:
+        for ids, mask in loader:
             with autocast:
-                embedded = [train_model(input_ids=ids.to(dev, non_blocking=True),
-                                        attention_mask=mask.to(dev, non_blocking=True))
-                            for ids, mask in views]
-            if len(embedded) == 1:                      # interleaved a,p,n
-                anchor, positive, negative = (embedded[0][i::3] for i in range(3))
-            else:                                       # anchors | positives+negatives
-                anchor, documents = embedded
-                positive, negative = documents.chunk(2, dim=0)
+                embedded = train_model(input_ids=ids.to(dev, non_blocking=True),
+                                       attention_mask=mask.to(dev, non_blocking=True))
+            anchor, positive, negative = (embedded[i::3] for i in range(3))  # interleaved a,p,n
             loss = info_nce_loss(anchor, positive, negative,
                                  temperature=args.temperature)
             optimizer.zero_grad(set_to_none=True)
@@ -528,7 +357,7 @@ def train(args):
     summary = {
         "protocol": args.protocol,
         "pooling": args.pooling,
-        "dataset": args.dataset,
+        "dataset": "nli",
         "model": hf_source or args.model,
         "backbone": "hf" if hf_source else "nexterabert",
         "hf_model": hf_source,
@@ -541,7 +370,6 @@ def train(args):
         "weight_decay": args.weight_decay,
         "temperature": args.temperature,
         "max_len": args.max_len,
-        "split_views": args.split_views,
         "llrd": args.llrd,
         "betas": [args.beta1, args.beta2],
         "eps": args.eps,
@@ -564,16 +392,14 @@ def train(args):
                                      tokenizer=tokenizer, run_summary=summary)
     print(json.dumps(summary, indent=2))
     print(f"[{args.protocol}] saved -> {out} (protocol recorded in {CONTRASTIVE_RUN_FILE})")
-    nxt = ("scripts/evaluate_retrieval.py" if args.dataset in ("msmarco", "mldr")
-           else "scripts/evaluate_mteb.py")
-    print(f"[{args.protocol}] next: python {nxt} --model {out}")
+    print(f"[{args.protocol}] next: python scripts/evaluate_mteb.py --model {out}")
 
 
 def parse_args(argv=None):
     g = OPTIM_DEFAULTS
     p = argparse.ArgumentParser()
     p.add_argument("--protocol", default="mteb-nli", choices=sorted(PROTOCOLS),
-                   help="which prior-work recipe to follow; sets the defaults below")
+                   help="the recipe to follow (OptiBERT App. D.2); sets the defaults below")
     p.add_argument("--model",
                    help="pretrained NexteraBERT backbone directory (or a directory "
                         "written by an earlier --hf_model run, to continue it)")
@@ -586,7 +412,6 @@ def parse_args(argv=None):
                    help="default: ModernBERT's for a NexteraBERT backbone, the "
                         "baseline's own for --hf_model / a baseline directory")
     # --- protocol-pinned; None means "take the protocol's value" ---
-    p.add_argument("--dataset", default=None, choices=["nli", "msmarco", "mldr"])
     p.add_argument("--pooling", default=None, choices=["attentive", "mean"],
                    help="attentive adds a trained pooling head; mean tunes the "
                         "encoder under the backbone's own masked mean pooling")
@@ -596,10 +421,6 @@ def parse_args(argv=None):
                         "so halving it on OOM weakens the objective (gradient "
                         "accumulation is not an equivalent substitute)")
     p.add_argument("--max_len", type=int, default=None)
-    p.add_argument("--split_views", dest="split_views", default=None,
-                   action="store_true",
-                   help="pad anchors apart from documents (asymmetric data)")
-    p.add_argument("--no_split_views", dest="split_views", action="store_false")
     p.add_argument("--max_samples", type=int, default=None,
                    help="cap the triplet count (0 = all)")
     p.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE)
@@ -616,7 +437,7 @@ def parse_args(argv=None):
                         "1.0 (or --no_llrd) restores the flat published protocol")
     p.add_argument("--no_llrd", dest="llrd_enabled", action="store_false",
                    help="disable layerwise LR decay and use the protocol LR at "
-                        "every depth (the published contrastive protocols)")
+                        "every depth (the published protocol)")
     p.set_defaults(llrd_enabled=True)
     p.add_argument("--beta1", type=float, default=g["beta1"])
     p.add_argument("--beta2", type=float, default=g["beta2"])
@@ -652,11 +473,6 @@ def parse_args(argv=None):
     for key, value in PROTOCOLS[args.protocol].items():
         if getattr(args, key) is None:
             setattr(args, key, value)
-    if args.pooling == "auto":
-        from nexterabert.simcse import has_pooling_head
-
-        args.pooling = ("attentive" if args.model and has_pooling_head(args.model)
-                        else "mean")
     if not args.llrd_enabled:
         args.llrd = 1.0
     if not 0.0 < args.llrd <= 1.0:

@@ -48,37 +48,30 @@ NPROC="${NPROC:-8}"
 DATA_REPO_ID="${DATA_REPO_ID:-RikkaBotan/NexteraBERT-data-mix}"
 
 # GLUE evaluation --------------------------------------------------------------
-# evaluate_glue.py fine-tunes RTE/MRPC/STS-B from an MNLI-tuned encoder and
-# averages over the seeds below. Per-task hyperparameters follow ModernBERT-base
-# (--recipe modernbert, the default; --recipe optibert switches to OptiBERT Table 4,
-# which also adds QNLI to the MNLI transfer). Each task caps how many of these seeds
-# it uses, as ModernBERT does (rte/mrpc/stsb up to 5, cola 4, sst2 3, the large
-# stable tasks - MNLI/QQP/QNLI - just one), and runs early-stop after 2 epochs
-# without val improvement. Add "--uniform_seeds --patience 0" to the
-# evaluate_glue.py call below to run every task on all seeds with full epoch
-# budgets. torch.compile + TF32 are on by default on CUDA. "all" = the 8
-# standard GLUE tasks (WNLI excluded).
+# evaluate_glue.py fine-tunes RTE/MRPC/STS-B/QNLI from an MNLI-tuned encoder and
+# averages over the seeds below, with its per-task hyperparameters. Each task caps
+# how many of these seeds it uses, as ModernBERT does (rte/mrpc/stsb up to 5, cola
+# 4, sst2 3, the large stable tasks - MNLI/QQP/QNLI - just one), and runs
+# early-stop after 2 epochs without val improvement. torch.compile + TF32 are on
+# by default on CUDA. "all" = the 8 standard GLUE tasks (WNLI excluded).
 # Override in the shell, e.g.
 #   GLUE_TASKS="sst2 rte" GLUE_SEEDS="1234" bash scripts/run_pipeline_bert.sh
 GLUE_TASKS="${GLUE_TASKS:-all}"
 GLUE_SEEDS="${GLUE_SEEDS:-19 8364 717 10536 90166}"   # MosaicBERT/ModernBERT 5-seed set
 
 # MTEB evaluation --------------------------------------------------------------
-# MTEB scores one vector per text, and an MLM/RTD backbone was never trained to
-# place related texts near each other - published MTEB numbers (OptiBERT Table 5,
-# App. D.2) are measured after a supervised-SimCSE stage with an attentive pooling
-# head. MTEB_FINETUNE=1 runs that stage first (scripts/finetune_contrastive.py
-# --protocol mteb-nli, single GPU: InfoNCE negatives come from the batch, so it is
-# deliberately not DDP-sharded) and scores its output. MTEB_FINETUNE=0 scores the
-# raw backbone with mean pooling instead - far cheaper, but off-protocol and not
-# comparable to any published number.
+# MTEB scores one vector per text, and an MLM backbone was never trained to place
+# related texts near each other - published MTEB numbers (OptiBERT Table 5, App.
+# D.2) are measured after a supervised-SimCSE stage with an attentive pooling
+# head. The stage runs that first (scripts/finetune_contrastive.py --protocol
+# mteb-nli, single GPU: InfoNCE negatives come from the batch, so it is
+# deliberately not DDP-sharded) and scores its output.
 # The default benchmark is the full English suite (41 tasks, several GPU-hours);
 # narrow it with MTEB_BENCHMARK / MTEB_TASK_TYPES / MTEB_EXCLUDE_TASKS / MTEB_MAX_TASKS, e.g.
 #   MTEB_TASK_TYPES="STS,PairClassification" MTEB_MAX_TASKS=4 bash scripts/run_pipeline_bert.sh
 #   MTEB_EXCLUDE_TASKS="MindSmallReranking" bash scripts/run_pipeline_bert.sh
 #   RUN_MTEB=0 bash scripts/run_pipeline_bert.sh                 # skip the stage entirely
 RUN_MTEB="${RUN_MTEB:-1}"
-MTEB_FINETUNE="${MTEB_FINETUNE:-1}"
 MTEB_BENCHMARK="${MTEB_BENCHMARK:-MTEB(eng, v2)}"
 MTEB_TASK_TYPES="${MTEB_TASK_TYPES:-}"          # e.g. "STS,Retrieval"; empty = all
 MTEB_EXCLUDE_TASKS="${MTEB_EXCLUDE_TASKS:-}"    # e.g. "MindSmallReranking"
@@ -264,35 +257,24 @@ log "GLUE results saved to glue_results_bert.json"
 # -- 3b. MTEB evaluation -----------------------------------------------------
 if [ "$RUN_MTEB" = "1" ]; then
     MTEB_START=$(date +%s)
-    MTEB_MODEL="$BACKBONE"
-    MTEB_POOLING="mean"
     MTEB_READY=1
-    if [ "$MTEB_FINETUNE" = "1" ]; then
-        log "SimCSE contrastive fine-tuning (MTEB protocol, MNLI+SNLI triplets) -> ${SIMCSE_DIR} ..."
-        if $PY scripts/finetune_contrastive.py \
-                --protocol mteb-nli \
-                --model "$BACKBONE" \
-                --tokenizer "$TOKENIZER" \
-                --no_llrd \
-                --output_dir "$SIMCSE_DIR"; then
-            MTEB_MODEL="$SIMCSE_DIR"
-            MTEB_POOLING="auto"    # picks up the trained attentive pooling head
-        else
-            # Falling through to the raw backbone would quietly report a mean-pooled
-            # number under the SimCSE protocol's name, so stop the stage instead.
-            log "ERROR: SimCSE fine-tuning failed - skipping MTEB rather than reporting"
-            log "  an off-protocol number. Re-run with MTEB_FINETUNE=0 if the weaker"
-            log "  raw-backbone number is what you want."
-            MTEB_READY=0
-        fi
-    else
-        log "MTEB_FINETUNE=0 - scoring the raw backbone with mean pooling (off-protocol)"
+    log "SimCSE contrastive fine-tuning (MTEB protocol, MNLI+SNLI triplets) -> ${SIMCSE_DIR} ..."
+    if ! $PY scripts/finetune_contrastive.py \
+            --protocol mteb-nli \
+            --model "$BACKBONE" \
+            --tokenizer "$TOKENIZER" \
+            --output_dir "$SIMCSE_DIR"; then
+        # Scoring the raw backbone instead would quietly report a mean-pooled number
+        # under the SimCSE protocol's name, so stop the stage.
+        log "ERROR: SimCSE fine-tuning failed - skipping MTEB"
+        MTEB_READY=0
     fi
 
     if [ "$MTEB_READY" = "1" ]; then
         # an array, not a string: the benchmark name contains a space ("MTEB(eng, v2)")
-        MTEB_ARGS=(--model "$MTEB_MODEL" --tokenizer "$TOKENIZER"
-                   --pooling "$MTEB_POOLING" --benchmark "$MTEB_BENCHMARK"
+        # --pooling auto picks up the trained attentive pooling head
+        MTEB_ARGS=(--model "$SIMCSE_DIR" --tokenizer "$TOKENIZER"
+                   --pooling auto --benchmark "$MTEB_BENCHMARK"
                    --max_len "$MTEB_MAX_LEN" --batch_size "$MTEB_BATCH_SIZE"
                    --output "$MTEB_OUT" --cache_dir "$MTEB_CACHE" --skip_errors)
         if [ -n "$MTEB_TASK_TYPES" ]; then
@@ -304,7 +286,7 @@ if [ "$RUN_MTEB" = "1" ]; then
         if [ "$MTEB_MAX_TASKS" != "0" ]; then
             MTEB_ARGS+=(--max_tasks "$MTEB_MAX_TASKS")
         fi
-        log "Running MTEB (${MTEB_BENCHMARK}) on ${MTEB_MODEL}, pooling=${MTEB_POOLING} ..."
+        log "Running MTEB (${MTEB_BENCHMARK}) on ${SIMCSE_DIR} ..."
         $PY scripts/evaluate_mteb.py "${MTEB_ARGS[@]}"
         MTEB_END=$(date +%s)
         MTEB_ELAPSED=$((MTEB_END - MTEB_START))

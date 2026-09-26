@@ -25,8 +25,8 @@ Two more things aid comparability (both on by default):
     reported as mean (± std) across them. Each task caps how many seeds it
     actually uses (small high-variance tasks average over several; large stable
     tasks — MNLI, QQP, QNLI — use one), so the big tasks are not needlessly
-    retrained per seed. Override with --uniform_seeds. WNLI is excluded from the
-    average by convention.
+    retrained per seed. Override with --uniform_seeds. WNLI is excluded by
+    convention.
 
 Two time-savers are on by default (roughly halving the fine-tuning compute);
 both are approximations of the paper protocol, and both can be switched off:
@@ -54,11 +54,10 @@ restores the published protocol exactly:
     module type (LayerNorm / RMSNorm / SeparableDyT), not by
     name, so nothing slips through; see build_optimizer.
   * Layerwise LR decay (LLRD, --llrd F, default 0.9) — a MULTIPLIER on whatever
-    LR the task already has (the built-in table's, an --hparams entry, or --lr):
-    the head keeps it, each block below trains at F x the block above, the
-    embeddings at F**(n_layer+1) x it. Keeps a small task (RTE, MRPC, CoLA) from
-    overwriting the pretrained lower layers. Per-task values can come from
-    --hparams; --llrd 1.0 / --no_llrd is the flat published protocol.
+    LR the task already has (the built-in table's, or --lr): the head keeps it,
+    each block below trains at F x the block above, the embeddings at
+    F**(n_layer+1) x it. Keeps a small task (RTE, MRPC, CoLA) from overwriting the
+    pretrained lower layers. --llrd 1.0 / --no_llrd is the flat published protocol.
 
 Multi-GPU: prefer --task_parallel (one task per single GPU, tasks run concurrently),
 which reproduces the per-task batch sizes exactly — they are TOTALS, so DDP-sharding
@@ -78,18 +77,6 @@ one task across GPUs would inflate the effective batch and hurt the small tasks.
 
 The default (--tasks all) runs the 8 standard GLUE tasks (WNLI excluded); pass e.g.
 --tasks sst2 rte for a quick subset.
-
-Four flags exist for scripts/search_glue.py, which drives this script to tune the
-per-task hyperparameters. They are search machinery — the first two make a run
-CHEAPER THAN THE PROTOCOL and must never produce a reported score:
-
-  * --train_subsample N   proxy training set (seed-fixed subset, dev set intact)
-  * --stop_after_epochs N screening rung: train N epochs, keep the LR schedule
-                          stretched over the full per-task budget
-  * --hparams FILE        per-task lr/wd/epochs/batch_size overriding the recipe
-                          table — the JSON the search writes
-  * --mnli_source DIR     reuse an already fine-tuned MNLI encoder for transfer
-                          instead of training one
 """
 
 from __future__ import annotations
@@ -153,7 +140,6 @@ GLUE_TASKS = {
     "mnli": ("premise", "hypothesis", 3, "acc"),
     "qnli": ("question", "sentence", 2, "acc"),
     "rte": ("sentence1", "sentence2", 2, "acc"),
-    "wnli": ("sentence1", "sentence2", 2, "acc"),
 }
 
 # ModernBERT-base's per-task GLUE recipe — the only table this script has. A good
@@ -180,7 +166,6 @@ GLUE_TASKS = {
 #
 #   5e-6 at lr 5e-5   -> 0.1     (cola/sst2/mrpc/stsb/qqp/qnli/rte)
 #   5e-6 at lr 1.5e-4 -> 0.0333  (mnli)
-#   1e-5 at lr 5e-5   -> 0.2     (wnli)
 #
 # Change an entry's lr and the equivalent wd moves with it; keep the values on this
 # torch scale (a composer-scale 5e-6 here would decay by ~2.5e-10 a step, i.e. not
@@ -201,8 +186,6 @@ TASK_DEFAULTS_MODERNBERT = {
     "mnli": {"lr": 1e-4, "epochs": 2,  "batch_size": 128, "weight_decay": 1e-2},
     "qnli": {"lr": 4e-5, "epochs": 2,  "batch_size": 16, "weight_decay": 5e-3},
     "rte":  {"lr": 4e-5, "epochs": 3,  "batch_size": 8, "weight_decay": 5e-3},
-    # WNLI is not in ModernBERT's table (excluded from the GLUE average); sane default.
-    "wnli": {"lr": 5e-5, "epochs": 5,  "batch_size": 16, "weight_decay": 0.2},
 }
 
 # Optimiser / schedule globals that the per-task table above does not vary. Every
@@ -233,22 +216,13 @@ MNLI_INIT_TASKS = ("rte", "mrpc", "stsb", "qnli")
 # --uniform_seeds to run every task on all --seeds.
 TASK_MAX_SEEDS = {
     "rte": 5, "mrpc": 5, "stsb": 5, "cola": 4, "sst2": 3,
-    "mnli": 1, "qqp": 1, "qnli": 1, "wnli": 1,
+    "mnli": 1, "qqp": 1, "qnli": 1,
 }
 
 # The 8 tasks that make up the standard GLUE average. WNLI is excluded by
 # convention (everyone reports its majority baseline), so MosaicBERT's headline
 # average is over exactly these — matching it here keeps the numbers comparable.
 GLUE_AVG_TASKS = ("cola", "sst2", "mrpc", "stsb", "qqp", "mnli", "qnli", "rte")
-
-# Fixed shuffle seed for --train_subsample. Deliberately NOT the run's --seeds
-# value: a hyperparameter search must rank its candidates on identical data, so
-# the proxy subset has to be the same for every run of a task.
-SUBSAMPLE_SEED = 20242024
-
-# Per-task keys a --hparams file may override (anything else is ignored, so the
-# "_search" history block search_glue.py writes alongside them is harmless).
-HPARAM_KEYS = ("lr", "weight_decay", "epochs", "batch_size", "llrd")
 
 # Default layerwise-LR-decay factor: each depth trains at this multiple of the
 # depth above it, on top of the task's own LR. 0.9 keeps the embeddings around 9%
@@ -260,31 +234,6 @@ DEFAULT_LLRD = 0.9
 # Torch weight decay for a task with no row in the table above (every GLUE task has
 # one, so this is only a floor for hand-added tasks). Matches the table's own scale.
 DEFAULT_WEIGHT_DECAY = 0.1
-
-_HPARAMS_CACHE = {}
-
-
-def load_hparams(path):
-    """Per-task hyperparameter overrides from a --hparams JSON file.
-
-    Returns {task: {lr/weight_decay/epochs/batch_size}}; {} when no file was
-    given. Parsed once per process (workers re-read it, which is why the path —
-    not the parsed values — is what gets forwarded to them)."""
-    if not path:
-        return {}
-    if path not in _HPARAMS_CACHE:
-        with open(path, encoding="utf-8") as f:
-            raw = json.load(f)
-        table = {}
-        for task, cfg in raw.items():
-            if task.startswith("_") or not isinstance(cfg, dict):
-                continue
-            if task not in GLUE_TASKS:
-                print(f"[glue][warn] --hparams: ignoring unknown task '{task}'")
-                continue
-            table[task] = {k: cfg[k] for k in HPARAM_KEYS if k in cfg}
-        _HPARAMS_CACHE[path] = table
-    return _HPARAMS_CACHE[path]
 
 
 def is_ddp():
@@ -519,26 +468,22 @@ def run_task(task, args, seed, model_path=None, save_backbone_to=None):
     tokenizer = (load_hf_tokenizer(args.tokenizer) if is_hf
                  else build_tokenizer(args.tokenizer))
 
-    # recipe table < --hparams file < explicit CLI override
-    file_defaults = load_hparams(args.hparams).get(task, {})
-    defaults = dict(TASK_DEFAULTS_MODERNBERT.get(task, {}))
-    defaults.update(file_defaults)
+    # recipe table < explicit CLI override
+    defaults = TASK_DEFAULTS_MODERNBERT.get(task, {})
     g = OPTIM_DEFAULTS
     lr = args.lr if args.lr is not None else defaults.get("lr", 2e-5)
     epochs = args.epochs if args.epochs is not None else defaults.get("epochs", 3)
     if task == "mnli" and args.mnli_epochs is not None:
         epochs = args.mnli_epochs   # --mnli_epochs beats --epochs for the transfer source
     batch_size = args.batch_size if args.batch_size is not None else defaults.get("batch_size", 32)
-    # NOTE --weight_decay must be checked BEFORE the table, like every other
-    # override: a hyperparameter search sweeping wd is otherwise silently pinned
-    # to the recipe's value.
+    # --weight_decay is checked BEFORE the table, like every other override.
     weight_decay = args.weight_decay if args.weight_decay is not None \
         else defaults.get("weight_decay", DEFAULT_WEIGHT_DECAY)
     # LLRD's per-layer factor. It MULTIPLIES the task LR resolved above (the
-    # recipe table, an --hparams entry or --lr): the head keeps that LR and each
-    # depth below it is scaled by llrd**(depth from the top). --no_llrd (llrd 1.0)
-    # gives every depth the task LR, i.e. the published flat protocol.
-    llrd = args.llrd if args.llrd is not None         else defaults.get("llrd", DEFAULT_LLRD)
+    # recipe table or --lr): the head keeps that LR and each depth below it is
+    # scaled by llrd**(depth from the top). --no_llrd (llrd 1.0) gives every depth
+    # the task LR, i.e. the published flat protocol.
+    llrd = args.llrd if args.llrd is not None else DEFAULT_LLRD
     if not args.llrd_enabled:
         llrd = 1.0
     # CLI overrides are None unless explicitly passed; otherwise take the recipe's.
@@ -553,17 +498,6 @@ def run_task(task, args, seed, model_path=None, save_backbone_to=None):
     train_split = raw["train"]
     val_key = "validation_matched" if task == "mnli" else "validation"
     val_split = raw[val_key]
-
-    # Proxy training set for hyperparameter search. Shuffled with a FIXED seed
-    # (not `seed`), so every candidate ranks on exactly the same examples and the
-    # comparison isn't confounded by which subset each one happened to draw. The
-    # dev set is never subsampled — the score has to stay comparable.
-    if args.train_subsample and args.train_subsample < len(train_split):
-        train_split = (train_split.shuffle(seed=SUBSAMPLE_SEED)
-                       .select(range(args.train_subsample)))
-        if rank == 0:
-            print(f"  [{task}] train subsampled to {args.train_subsample} examples "
-                  f"(proxy; search only)")
 
     train_split = encode_dataset(train_split, tokenizer, c1, c2, args.max_len)
     val_split = encode_dataset(val_split, tokenizer, c1, c2, args.max_len)
@@ -639,11 +573,6 @@ def run_task(task, args, seed, model_path=None, save_backbone_to=None):
 
     sched = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    # Screening rung: stop early but leave total_steps (and therefore the whole LR
-    # schedule) on the FULL budget, so candidates with different epoch counts are
-    # all compared at the same point of their own schedule.
-    run_epochs = min(epochs, args.stop_after_epochs) if args.stop_after_epochs else epochs
-
     use_amp = args.dtype != "fp32" and dev.type == "cuda"
     dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[args.dtype]
     autocast = (
@@ -654,8 +583,6 @@ def run_task(task, args, seed, model_path=None, save_backbone_to=None):
     if rank == 0:
         gpu_label = f" x{world_size} GPUs" if ddp else ""
         init_label = "  init=MNLI" if model_path else ""
-        if run_epochs < epochs:
-            init_label += f"  [screening: {run_epochs}/{epochs} epochs, full schedule]"
         print(f"  seed={seed}  lr={lr:.1e}  epochs={epochs}  bs={batch_size}{gpu_label}"
               f"  wd={weight_decay:.1e}  betas=({beta1},{beta2})  eps={eps:.0e}"
               f"  sched={schedule}  warmup={warmup_pct}  alpha_f={alpha_f}  dtype={args.dtype}{init_label}")
@@ -672,7 +599,7 @@ def run_task(task, args, seed, model_path=None, save_backbone_to=None):
     best = None
     best_state = None      # best-epoch weights (kept only for the transfer source)
     epochs_since_best = 0
-    for epoch in range(run_epochs):
+    for epoch in range(epochs):
         model.train()
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
@@ -700,7 +627,7 @@ def run_task(task, args, seed, model_path=None, save_backbone_to=None):
         if rank == 0:
             scores = compute_metric(metric, preds, labels)
             primary = float(np.mean(list(scores.values())))
-            print(f"  [{task}] epoch {epoch+1}/{run_epochs}: {scores}")
+            print(f"  [{task}] epoch {epoch+1}/{epochs}: {scores}")
             if best is None or primary > best["_primary"]:
                 best = {**scores, "_primary": primary}
                 epochs_since_best = 0
@@ -721,7 +648,7 @@ def run_task(task, args, seed, model_path=None, save_backbone_to=None):
                           for k, v in raw_model.state_dict().items()}
         if stop:
             if rank == 0:
-                print(f"  [{task}] early stop after epoch {epoch+1}/{run_epochs} "
+                print(f"  [{task}] early stop after epoch {epoch+1}/{epochs} "
                       f"(no improvement for {args.patience} epochs; "
                       f"--patience 0 disables)")
             break
@@ -800,15 +727,6 @@ def parse_args():
     p.add_argument("--mnli_cache_dir", default=None,
                    help="directory for the transient MNLI-tuned encoder used for "
                         "transfer (default: system temp)")
-    p.add_argument("--mnli_source", default=None,
-                   help="reuse an ALREADY fine-tuned MNLI encoder (a directory "
-                        "written by a previous run's transfer export, e.g. "
-                        "search_glue.py's work_dir/mnli_best) instead of training "
-                        "one. rte/mrpc/stsb/qnli start from it "
-                        "immediately. The directory is never deleted. If it also "
-                        "holds a glue_score.json for the first --seeds entry, that "
-                        "score is reused for the mnli task itself; otherwise mnli "
-                        "(when requested) is trained as an ordinary task.")
     p.add_argument("--epochs", type=int, default=None,
                    help="override epochs for all tasks (default: per-task)")
     p.add_argument("--mnli_epochs", type=int, default=None,
@@ -834,39 +752,18 @@ def parse_args():
                         "task absent from the table")
     p.add_argument("--llrd", type=float, default=None,
                    help="layerwise LR decay (LLRD) factor in (0, 1], applied as a "
-                        "MULTIPLIER on the task's own LR (the table's, an "
-                        "--hparams entry, or --lr): the head keeps that LR, block "
-                        "n_layer trains at llrd x it, and so on down to the "
-                        "embeddings at llrd**(n_layer+1) x it. The standard "
-                        "BERT/DeBERTa discriminative fine-tuning trick — it keeps a "
-                        "small task (RTE/MRPC/CoLA) from overwriting the pretrained "
-                        f"lower layers. Default {DEFAULT_LLRD}; typical 0.8-0.95; 1.0 "
-                        "(or --no_llrd) is a flat LR, the protocol as published. "
-                        "Per-task values can also come from --hparams.")
+                        "MULTIPLIER on the task's own LR (the table's, or --lr): "
+                        "the head keeps that LR, block n_layer trains at llrd x it, "
+                        "and so on down to the embeddings at llrd**(n_layer+1) x it. "
+                        "The standard BERT/DeBERTa discriminative fine-tuning trick "
+                        "— it keeps a small task (RTE/MRPC/CoLA) from overwriting "
+                        f"the pretrained lower layers. Default {DEFAULT_LLRD}; "
+                        "typical 0.8-0.95; 1.0 (or --no_llrd) is a flat LR, the "
+                        "protocol as published.")
     p.add_argument("--no_llrd", dest="llrd_enabled", action="store_false",
                    help="disable layerwise LR decay: every depth trains at the task's "
                         "LR (the ModernBERT protocol as published)")
     p.set_defaults(llrd_enabled=True)
-    p.add_argument("--hparams", default=None,
-                   help="JSON file of per-task hyperparameters that overrides the "
-                        "built-in table: {\"rte\": {\"lr\": 3e-5, \"weight_decay\": "
-                        "0.1, \"epochs\": 3, \"batch_size\": 8, \"llrd\": 0.9}, ...}. "
-                        "Exactly the "
-                        "format search_glue.py writes (top-level keys starting with "
-                        "'_' are ignored). Explicit --lr/--weight_decay/--epochs/"
-                        "--batch_size/--llrd still win over the file.")
-    p.add_argument("--train_subsample", type=int, default=0,
-                   help="cap each task's TRAINING set at this many examples — a "
-                        "seed-fixed random subset (independent of --seeds, so every "
-                        "candidate of a hyperparameter search sees identical data). "
-                        "0 (default) = full data. Proxy for search runs only; never "
-                        "use it for reported scores.")
-    p.add_argument("--stop_after_epochs", type=int, default=0,
-                   help="train at most this many epochs while keeping the LR "
-                        "schedule stretched over the FULL per-task epoch budget — "
-                        "the screening rung of a successive-halving search, where "
-                        "candidates are compared mid-schedule on equal footing. "
-                        "0 (default) = run the full budget.")
     # AdamW / schedule globals. Default None = take the value from OPTIM_DEFAULTS;
     # per-task lr/bs/wd/epochs come from TASK_DEFAULTS_MODERNBERT.
     p.add_argument("--beta1", type=float, default=None)
@@ -934,37 +831,6 @@ def aggregate_runs(runs):
     return agg
 
 
-def external_mnli_source(args):
-    """Resolve --mnli_source into (encoder_dir, cached_mnli_score).
-
-    The directory is an MNLI-tuned encoder exported by an earlier run (typically
-    search_glue.py's work_dir/mnli_best, trained on FULL data with the winning
-    recipe), so the dependents can start from it without retraining. If it also
-    carries a glue_score.json for this run's first seed — i.e. the very run the
-    final evaluation would otherwise repeat — that score is reused for the mnli
-    task itself. Returns (None, None) when no source was given."""
-    if not args.mnli_source:
-        return None, None
-    src = Path(args.mnli_source)
-    if not src.is_dir():
-        sys.exit(f"--mnli_source: not a directory: {src}")
-    if not args.mnli_transfer:
-        print("[glue][warn] --mnli_source ignored (--no_mnli_transfer was passed)")
-        return None, None
-    score = None
-    score_file = src / "glue_score.json"
-    if score_file.exists():
-        try:
-            rec = json.loads(score_file.read_text(encoding="utf-8"))
-            # Seed must match, or the reused number would not be the one this
-            # run's protocol produces.
-            if rec.get("task") == "mnli" and rec.get("seed") == args.seeds[0]:
-                score = rec.get("best")
-        except (OSError, json.JSONDecodeError, TypeError) as e:
-            print(f"[glue][warn] unreadable {score_file}: {e}")
-    return str(src), score
-
-
 def run_serial(args):
     """Sequential execution: tasks run one after another, each optionally sharded
     across GPUs via DDP (under torchrun). This is the fallback path; --task_parallel
@@ -1007,25 +873,9 @@ def run_serial(args):
     # MNLI transfer source: trained ONCE (first seed) and shared by every seed of
     # RTE/MRPC/STS-B. MNLI is stable, so a single seed is the reference recipe and
     # avoids retraining the most expensive task once per downstream seed.
-    # --mnli_source supplies that encoder from an earlier run instead.
-    ext_mnli, ext_mnli_score = external_mnli_source(args)
     mnli_backbone = None
     mnli_scored = False        # is the mnli task's own score already accounted for?
-    if need_mnli and ext_mnli:
-        mnli_backbone = ext_mnli
-        if rank == 0:
-            print(f"[glue] reusing the MNLI transfer source at {ext_mnli} "
-                  f"(not retrained, not deleted)")
-        if "mnli" in args.tasks and ext_mnli_score is not None:
-            per_task_runs["mnli"].append(ext_mnli_score)
-            mnli_scored = True
-            if rank == 0:
-                print(f"[glue] reusing its recorded mnli score "
-                      f"(seed {args.seeds[0]}, primary={ext_mnli_score['_primary']:.4f})")
-        elif "mnli" in args.tasks and rank == 0:
-            print("[glue] no matching glue_score.json in the source — mnli will be "
-                  "trained as an ordinary task for its own score")
-    elif need_mnli:
+    if need_mnli:
         src_seed = args.seeds[0]
         # rank-local path — every replica writes its own identical copy, so no
         # shared filesystem or extra barrier is needed (multi-node safe).
@@ -1040,7 +890,7 @@ def run_serial(args):
 
     for task in args.tasks:
         if task == "mnli" and mnli_scored:
-            continue   # already trained above as the transfer source (or reused)
+            continue   # already trained above as the transfer source
         init_path = mnli_backbone if task in init_tasks else None
         task_seeds = seeds_for(task)
         for seed in task_seeds:
@@ -1071,7 +921,7 @@ def finalize_results(args, per_task_runs, need_mnli):
         if per_task_runs.get(task):
             results[task] = aggregate_runs(per_task_runs[task])
 
-    avg_tasks = [t for t in results if t != "wnli"]
+    avg_tasks = list(results)
     avg = (float(np.mean([results[t]["_primary"] for t in avg_tasks]))
            if avg_tasks else 0.0)
     results["glue_avg"] = avg
@@ -1088,8 +938,6 @@ def finalize_results(args, per_task_runs, need_mnli):
         n = results[t].get("_n_seeds", 1)   # per-task: TASK_MAX_SEEDS caps --seeds
         print(f"  {t:5s} {results[t]['_primary']:.4f}{extra}  "
               f"({n} seed{'s' if n != 1 else ''})")
-    if "wnli" in results:
-        print(f"  (wnli {results['wnli']['_primary']:.4f} — reported, not in average)")
 
     # Write the results JSON BEFORE touching W&B: by this point the evaluation
     # is fully done (and task-parallel has already deleted the per-worker temp
@@ -1171,12 +1019,6 @@ def _worker_cmd(args, job):
     # silently fine-tune under a different recipe than the one asked for.
     if not args.llrd_enabled:
         cmd += ["--no_llrd"]
-    if args.hparams:
-        cmd += ["--hparams", os.path.abspath(args.hparams)]
-    if args.train_subsample:
-        cmd += ["--train_subsample", str(args.train_subsample)]
-    if args.stop_after_epochs:
-        cmd += ["--stop_after_epochs", str(args.stop_after_epochs)]
     if not args.compile:
         cmd += ["--no_compile"]
     if job.get("init"):
@@ -1210,10 +1052,9 @@ def run_task_parallel(args):
     cache_root = args.mnli_cache_dir or tempfile.gettempdir()
     model_tag = hashlib.md5(str(Path(args.model).resolve()).encode()).hexdigest()[:8]
     work_dir = tempfile.mkdtemp(prefix="nb_glue_par_")
-    ext_mnli, ext_mnli_score = external_mnli_source(args)
     mnli_dir = None
     if need_mnli:
-        mnli_dir = ext_mnli or os.path.join(cache_root, f"nb_glue_mnli_{model_tag}")
+        mnli_dir = os.path.join(cache_root, f"nb_glue_mnli_{model_tag}")
 
     def seeds_for(task):
         if args.uniform_seeds:
@@ -1222,29 +1063,17 @@ def run_task_parallel(args):
         return args.seeds[:max(1, min(cap, len(args.seeds)))]
 
     # Build the job list. The MNLI source (first seed) is trained once and shared by
-    # every dependent seed, exactly as in the serial path — unless --mnli_source
-    # already supplies that encoder, in which case nothing blocks the dependents.
+    # every dependent seed, exactly as in the serial path.
     per_task_runs = {t: [] for t in args.tasks}
     jobs = []
     mnli_scored = False        # is the mnli task's own score already accounted for?
-    if need_mnli and ext_mnli:
-        print(f"[glue] reusing the MNLI transfer source at {ext_mnli} "
-              f"(not retrained, not deleted) — dependents start immediately")
-        if "mnli" in args.tasks and ext_mnli_score is not None:
-            per_task_runs["mnli"].append(ext_mnli_score)
-            mnli_scored = True
-            print(f"[glue] reusing its recorded mnli score "
-                  f"(seed {args.seeds[0]}, primary={ext_mnli_score['_primary']:.4f})")
-        elif "mnli" in args.tasks:
-            print("[glue] no matching glue_score.json in the source — mnli will be "
-                  "trained as an ordinary task for its own score")
-    elif need_mnli:
+    if need_mnli:
         jobs.append({"task": "mnli", "seed": args.seeds[0], "init": None,
                      "save_bb": mnli_dir, "needs_mnli": False, "is_mnli_src": True})
         mnli_scored = True
     for task in args.tasks:
         if task == "mnli" and mnli_scored:
-            continue   # already scheduled as the transfer source (or reused)
+            continue   # already scheduled as the transfer source
         is_dep = need_mnli and task in init_tasks
         for seed in seeds_for(task):
             jobs.append({"task": task, "seed": seed,
@@ -1256,7 +1085,7 @@ def run_task_parallel(args):
     free = list(range(num_gpus))
     pending = list(jobs)
     running = {}                       # proc -> (job, gpu)
-    mnli_done = (not need_mnli) or bool(ext_mnli)   # a reused source is ready now
+    mnli_done = not need_mnli
 
     def collect(job, ret):
         best = None
@@ -1309,8 +1138,7 @@ def run_task_parallel(args):
             time.sleep(2)
 
     shutil.rmtree(work_dir, ignore_errors=True)
-    if mnli_dir and not ext_mnli:
-        # only the transient encoder this run trained — never a --mnli_source
+    if mnli_dir:
         shutil.rmtree(mnli_dir, ignore_errors=True)
     finalize_results(args, per_task_runs, need_mnli)
 

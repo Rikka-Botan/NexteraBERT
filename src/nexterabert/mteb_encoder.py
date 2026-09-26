@@ -1,8 +1,7 @@
 """MTEB-compatible encoder wrapper around ``NexteraBERTForEmbedding``.
 
-Shared by `scripts/evaluate_retrieval.py` (NanoBEIR/BEIR) and
-`scripts/evaluate_mteb.py` (the full MTEB suite). Kept out of `__init__`'s lazy
-export table on purpose: it is only useful when the optional `mteb` extra is
+Used by `scripts/evaluate_mteb.py` (the full MTEB suite). Kept out of `__init__`'s
+lazy export table on purpose: it is only useful when the optional `mteb` extra is
 installed.
 
 mteb >= 2.0 dispatches on `runtime_checkable` protocols instead of duck typing,
@@ -93,14 +92,13 @@ def build_model_meta(name, embed_dim, n_parameters, max_tokens, similarity="cosi
 
     mteb builds an anonymous meta when this is None, so schema drift between
     mteb versions degrades to that instead of breaking the run. ``similarity`` is
-    ``"cosine"`` for the single-vector encoders here and ``"max_sim"`` for the
-    ColBERT wrapper in ``scripts/evaluate_colbert.py``.
+    ``"cosine"`` for the single-vector encoders here.
     """
     try:
         from mteb.models.model_meta import ModelMeta, ScoringFunction
 
-        fn = {"cosine": ScoringFunction.COSINE, "dot": ScoringFunction.DOT_PRODUCT,
-              "max_sim": ScoringFunction.MAX_SIM}[similarity]
+        fn = {"cosine": ScoringFunction.COSINE,
+              "dot": ScoringFunction.DOT_PRODUCT}[similarity]
         return ModelMeta(
             loader=None,
             name=name,
@@ -297,8 +295,7 @@ class NexteraEncoder(_MeanPoolEncoder):
         self.tokenizer = build_tokenizer(tokenizer_name)
         # A directory written by scripts/finetune_contrastive.py under the MTEB
         # protocol carries a trained attentive pooling head next to the backbone.
-        # Without one, fall back to the backbone's own masked mean pooling --
-        # which is what the retrieval protocol trains (see nexterabert.simcse).
+        # Without one, fall back to the backbone's own masked mean pooling.
         self.pooling = pooling
         if pooling == "attentive" or (pooling == "auto" and has_pooling_head(model_path)):
             self.model, config, info = load_for_sentence_embedding(model_path)
@@ -352,22 +349,15 @@ class NexteraEncoder(_MeanPoolEncoder):
 
 
 class HFEncoder(_MeanPoolEncoder):
-    """The same recipe over any Hugging Face ``AutoModel`` (ModernBERT, NeoBERT, BERT).
+    """The same recipe over any Hugging Face ``AutoModel`` (ModernBERT, NeoBERT, LFM2.5).
 
-    A raw MLM/RTD encoder has never been trained to put semantically similar
-    sentences near each other, so its zero-shot MTEB scores are low by
-    construction -- the question is only whether NexteraBERT is low *for its
-    class*. This runs a reference encoder through the identical tokenisation,
-    pooling, normalisation and scoring path, which turns "is the score too low?"
-    into a comparison instead of a guess.
-
-    ``model_name`` is a Hub id (scored zero-shot with masked mean pooling) or a
-    directory written by ``scripts/finetune_contrastive.py --hf_model``, whose
-    trained attentive head is picked up with ``pooling="auto"`` exactly as
-    :class:`NexteraEncoder` does -- so a baseline and NexteraBERT can be scored
-    after the *same* contrastive stage. NeoBERT's remote-code quirks (xformers
-    import, zero-filled RoPE table under transformers 5, bool mask) are handled
-    in ``nexterabert.hf_baselines``.
+    ``model_name`` is a directory written by ``scripts/finetune_contrastive.py
+    --hf_model``, whose trained attentive head is picked up with
+    ``pooling="auto"`` exactly as :class:`NexteraEncoder` does -- so a baseline and
+    NexteraBERT are scored after the *same* contrastive stage, through the identical
+    tokenisation, pooling, normalisation and scoring path. NeoBERT's remote-code
+    quirks (xformers import, zero-filled RoPE table under transformers 5, bool mask)
+    are handled in ``nexterabert.hf_baselines``.
     """
 
     def __init__(self, model_name, tokenizer_name=None, max_len=512, batch_size=64,
@@ -424,8 +414,3 @@ class HFEncoder(_MeanPoolEncoder):
         # HFForSentenceEmbedding: AutoModel last_hidden_state -> attentive head
         # or masked mean, the same two poolings NexteraEncoder scores with.
         return self.model(input_ids=input_ids, attention_mask=attention_mask)
-
-
-#: Old name: the zero-shot mean-pool baseline path. ``HFEncoder`` with a Hub id
-#: and ``pooling="auto"`` is exactly that.
-HFMeanPoolEncoder = HFEncoder

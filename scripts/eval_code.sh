@@ -1,25 +1,20 @@
 #!/usr/bin/env bash
-# Code columns of ModernBERT's Table 1 (Warner et al., 2024, 3.1.4): CodeSearchNet
-# (CSN) and StackOverflow-QA (SQA), "evaluated using the CoIR framework as
-# single-vector retrieval tasks", with "the best hyper-parameters identified in
-# Section 3.1.2" -- i.e. the single-vector checkpoint eval_dpr.sh selects (under
-# RETRIEVAL_PROTOCOL, default the MTEB-side mteb-nli stage; see eval_common.sh),
-# scored on the two CoIR tasks (nDCG@10):
+# Code retrieval: CodeSearchNet (CSN) and StackOverflow-QA (SQA), scored as
+# single-vector retrieval tasks of the CoIR framework (nDCG@10) on the MS MARCO
+# checkpoint eval_dpr.sh trains (see eval_common.sh):
 #
 #   * CSN: CoIR's CodeSearchNet, code -> docstring ("identify relevant docstring
 #     or comments for code blocks"); mteb task COIRCodeSearchNetRetrieval, the
 #     mean over its six language subsets.
 #   * SQA: StackOverflow-QA, hybrid text+code, ~2000 tokens per query/document
 #     on average, so it is read at the full 8192 context; mteb task StackOverflowQA.
-# Table 1 reference (base): BERT 41.2 / 59.5, ModernBERT 56.4 / 73.6.
 #
 # Usage:
-#   bash scripts/eval_dpr.sh && bash scripts/eval_code.sh   # reuse the selected DPR checkpoint
+#   bash scripts/eval_dpr.sh && bash scripts/eval_code.sh   # reuse the DPR checkpoint
 #   bash scripts/eval_code.sh                                # trains one at DPR_LR if none exists
-#   RETRIEVAL_MODEL=checkpoints/nextera-130B-simcse bash scripts/eval_code.sh   # reuse the MTEB checkpoint
 #   DPR_MODEL=checkpoints/mezzoforte/dpr bash scripts/eval_code.sh
 #   MODEL=LiquidAI/LFM2.5-Encoder-230M LONG_RETRIEVAL_BATCH_SIZE=16 bash scripts/eval_code.sh
-#       # a baseline: CSN + SQA on the checkpoint its eval_dpr.sh run selected
+#       # a baseline: CSN + SQA on the checkpoint its eval_dpr.sh run trained
 #
 # Output: ${OUT_DIR}/code_results.json
 set -euo pipefail
@@ -55,7 +50,7 @@ if done_or_skip "$CODE_OUT"; then exit 0; fi
 
 # -- the single-vector checkpoint --------------------------------------------
 # DPR_MODEL (explicit) > RETRIEVAL_MODEL (reused checkpoint) > the one eval_dpr.sh
-# selected > train one here under RETRIEVAL_PROTOCOL.
+# recorded > train one here.
 if [ -z "$DPR_MODEL" ]; then
     DPR_MODEL=$(resolve_retrieval_model)
     [ -n "$DPR_MODEL" ] && log "using the contrastive checkpoint: ${DPR_MODEL}"
@@ -63,12 +58,12 @@ fi
 if [ -z "$DPR_MODEL" ]; then
     BACKBONE=$(resolve_model "$MODEL")
     DPR_MODEL="${DPR_ROOT}/lr${DPR_LR}"
-    log "no contrastive checkpoint yet - training one (${RETRIEVAL_PROTOCOL}, lr=${DPR_LR}); eval_dpr.sh runs the sweep"
+    log "no contrastive checkpoint yet - training one (lr=${DPR_LR})"
     train_dpr "$BACKBONE" "$DPR_LR" "$DPR_MODEL"
-    [ -f "$SELECTED" ] || record_selected "$SELECTED" "$DPR_LR" "$DPR_MODEL" "$DPR_LR"
+    [ -f "$SELECTED" ] || record_selected "$SELECTED" "$DPR_LR" "$DPR_MODEL"
 fi
 if [ ! -f "${DPR_MODEL}/contrastive_run.json" ]; then
-    log "WARNING: ${DPR_MODEL} records no contrastive stage - scores will not be comparable to Table 1"
+    log "WARNING: ${DPR_MODEL} records no contrastive stage - it is not an MS MARCO stage output"
 fi
 
 # -- CoIR tasks ----------------------------------------------------------------
