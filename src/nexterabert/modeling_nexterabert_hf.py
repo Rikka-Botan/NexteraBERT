@@ -38,7 +38,10 @@ from transformers import PreTrainedModel
 from transformers.modeling_outputs import (
     BaseModelOutputWithPooling,
     MaskedLMOutput,
+    MultipleChoiceModelOutput,
+    QuestionAnsweringModelOutput,
     SequenceClassifierOutput,
+    TokenClassifierOutput,
 )
 
 from .configuration_nexterabert import NexteraBERTConfig
@@ -56,6 +59,12 @@ AUTO_MAP = {
     "AutoModelForMaskedLM": "modeling_nexterabert_hf.NexteraBERTForMaskedLM",
     "AutoModelForSequenceClassification":
         "modeling_nexterabert_hf.NexteraBERTForSequenceClassification",
+    "AutoModelForTokenClassification":
+        "modeling_nexterabert_hf.NexteraBERTForTokenClassification",
+    "AutoModelForQuestionAnswering":
+        "modeling_nexterabert_hf.NexteraBERTForQuestionAnswering",
+    "AutoModelForMultipleChoice":
+        "modeling_nexterabert_hf.NexteraBERTForMultipleChoice",
 }
 
 
@@ -256,6 +265,151 @@ class NexteraBERTForSequenceClassification(NexteraBERTPreTrainedModel):
         return SequenceClassifierOutput(loss=loss, logits=logits)
 
 
+class NexteraBERTForTokenClassification(NexteraBERTPreTrainedModel):
+    """Per-token classifier (NER, POS tagging, ...).
+
+    As in ``ModernBertForTokenClassification``, the prediction-head transform and
+    dropout sit between the encoder and the classifier. The transform is newly
+    initialised here, like the classifier: ``mlm_head.safetensors`` is not read.
+    """
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.num_labels = getattr(config, "num_labels", 2)
+        self.encoder = NexteraBERT(config)
+        self.head = NexteraBERTPredictionHead(config)
+        self.dropout = nn.Dropout(getattr(config, "classifier_dropout", 0.0) or 0.0)
+        self.classifier = nn.Linear(config.n_embd, self.num_labels)
+        self.post_init()
+
+    def get_input_embeddings(self):
+        return self.encoder.embedding
+
+    def set_input_embeddings(self, value):
+        self.encoder.embedding = value
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        token_type_ids: torch.Tensor | None = None,
+        labels: torch.LongTensor | None = None,
+        return_dict: bool | None = None,
+        **kwargs,
+    ):
+        hidden, _ = self.encoder(input_ids, None, attention_mask, token_type_ids)
+        logits = self.classifier(self.dropout(self.head(hidden)))
+        loss = None
+        if labels is not None:
+            loss = nn.functional.cross_entropy(
+                logits.view(-1, self.num_labels).float(), labels.view(-1))
+        if return_dict is False:
+            return (loss, logits) if loss is not None else (logits,)
+        return TokenClassifierOutput(loss=loss, logits=logits)
+
+
+class NexteraBERTForQuestionAnswering(NexteraBERTPreTrainedModel):
+    """Extractive-QA span head: start / end logits per token.
+
+    Same layout as :class:`NexteraBERTForTokenClassification` (transform + dropout
+    + classifier), with the two output labels read as span start and span end.
+    """
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.num_labels = getattr(config, "num_labels", 2)
+        self.encoder = NexteraBERT(config)
+        self.head = NexteraBERTPredictionHead(config)
+        self.dropout = nn.Dropout(getattr(config, "classifier_dropout", 0.0) or 0.0)
+        self.classifier = nn.Linear(config.n_embd, self.num_labels)
+        self.post_init()
+
+    def get_input_embeddings(self):
+        return self.encoder.embedding
+
+    def set_input_embeddings(self, value):
+        self.encoder.embedding = value
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        token_type_ids: torch.Tensor | None = None,
+        start_positions: torch.LongTensor | None = None,
+        end_positions: torch.LongTensor | None = None,
+        return_dict: bool | None = None,
+        **kwargs,
+    ):
+        hidden, _ = self.encoder(input_ids, None, attention_mask, token_type_ids)
+        logits = self.classifier(self.dropout(self.head(hidden)))
+        start_logits, end_logits = logits.split(1, dim=-1)
+        start_logits = start_logits.squeeze(-1).contiguous()
+        end_logits = end_logits.squeeze(-1).contiguous()
+        loss = None
+        if start_positions is not None and end_positions is not None:
+            if start_positions.dim() > 1:
+                start_positions = start_positions.squeeze(-1)
+            if end_positions.dim() > 1:
+                end_positions = end_positions.squeeze(-1)
+            # An answer outside the window is clamped onto an index the loss ignores.
+            ignored_index = start_logits.size(1)
+            start_positions = start_positions.clamp(0, ignored_index)
+            end_positions = end_positions.clamp(0, ignored_index)
+            start_loss = nn.functional.cross_entropy(
+                start_logits.float(), start_positions, ignore_index=ignored_index)
+            end_loss = nn.functional.cross_entropy(
+                end_logits.float(), end_positions, ignore_index=ignored_index)
+            loss = (start_loss + end_loss) / 2
+        if return_dict is False:
+            output = (start_logits, end_logits)
+            return (loss, *output) if loss is not None else output
+        return QuestionAnsweringModelOutput(
+            loss=loss, start_logits=start_logits, end_logits=end_logits)
+
+
+class NexteraBERTForMultipleChoice(NexteraBERTPreTrainedModel):
+    """One score per choice from the pooled representation; inputs are
+    ``(batch, num_choices, seq_len)``."""
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.encoder = NexteraBERT(config)
+        self.dropout = nn.Dropout(getattr(config, "classifier_dropout", 0.0) or 0.0)
+        self.classifier = nn.Linear(config.n_embd, 1)
+        self.post_init()
+
+    def get_input_embeddings(self):
+        return self.encoder.embedding
+
+    def set_input_embeddings(self, value):
+        self.encoder.embedding = value
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        token_type_ids: torch.Tensor | None = None,
+        labels: torch.LongTensor | None = None,
+        return_dict: bool | None = None,
+        **kwargs,
+    ):
+        # (B, num_choices, T) -> (B*num_choices, T): the encoder is strictly 2-D.
+        num_choices = input_ids.size(1)
+        input_ids = input_ids.view(-1, input_ids.size(-1))
+        if attention_mask is not None:
+            attention_mask = attention_mask.view(-1, attention_mask.size(-1))
+        if token_type_ids is not None:
+            token_type_ids = token_type_ids.view(-1, token_type_ids.size(-1))
+        _, pooled = self.encoder(input_ids, None, attention_mask, token_type_ids)
+        logits = self.classifier(self.dropout(pooled)).view(-1, num_choices)
+        loss = None
+        if labels is not None:
+            loss = nn.functional.cross_entropy(logits.float(), labels.view(-1))
+        if return_dict is False:
+            return (loss, logits) if loss is not None else (logits,)
+        return MultipleChoiceModelOutput(loss=loss, logits=logits)
+
+
 def _fetch_mlm_head(path, token=None, revision=None):
     """Read ``mlm_head.safetensors`` from a local directory or a Hub repo id."""
     if os.path.isdir(path):
@@ -282,4 +436,7 @@ __all__ = [
     "NexteraBERTModel",
     "NexteraBERTForMaskedLM",
     "NexteraBERTForSequenceClassification",
+    "NexteraBERTForTokenClassification",
+    "NexteraBERTForQuestionAnswering",
+    "NexteraBERTForMultipleChoice",
 ]

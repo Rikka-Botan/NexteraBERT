@@ -1256,34 +1256,27 @@ class NexteraHRA(nn.Module):
 
 class SnowstormConv(nn.Module):
     """State-space 1D convolution (SSM) as a *separable* low-rank operator.
- 
-    Optimised version. The original realised the temporal mixing by unfolding
-    the low-rank features to (B, T, r*k) and applying a single dense
-    out_proj of shape (C, r*k). With r=128, k=5 that is r*k = 640 ~= C = 768,
-    so out_proj was effectively a full (C, C) GEMM and the op cost
-    ~= B*T*C*r*(k+1) MACs -- on par with a depthwise-separable conv, hence
-    "no faster than DS conv".
- 
-    Here the temporal mixing is factored into a *depthwise* SSM kernel applied
-    in the r-dimensional latent space, followed by a single up-projection:
- 
+
+    The input is projected down to an r-dimensional latent space, mixed over time
+    there by a *depthwise* SSM kernel (one length-k filter per latent channel),
+    joined by a pointwise low-rank path, and projected back up:
+
         z = in_proj(x)                              # C -> r   (B*T*C*r)
         a = A(x)                                    # C -> r   (B*T*C*r)
         s[t] = sum_j kernel[:, j] * z[t+j-k//2]     # depthwise (B*T*r*k, cheap;
                                                     #   causal: z[t+j-k+1])
         y = out_proj(s + a)                         # r -> C   (B*T*r*C)
- 
-    Total ~= 3*B*T*C*r MACs -- roughly (k+1)/3 = 2x fewer than the original for
-    k=5, while keeping the same down/up low-rank structure and an explicit,
-    per-latent-channel temporal (SSM) filter. The depthwise mixing is run as a
-    single fused depthwise conv1d (groups=r) so it is one kernel launch -- a
-    naive Python shift-and-add over the k taps would instead issue k separate
-    memory-bound elementwise kernels that dominate on GPU once the GEMMs shrink.
- 
-    NOTE: this changes the parameterisation (out_proj is now (C, r) instead of
-    (C, r*k), plus a (r, k) kernel), so weights are not interchangeable with the
-    original -- the module must be (re)trained. Output shape is unchanged.
-    When non-causal, kernel_size must be odd to preserve T.
+
+    Total ~= 3*B*T*C*r MACs: three C<->r GEMMs, beside which the depthwise term
+    is negligible. The depthwise mixing is run as a single fused depthwise conv1d
+    (groups=r) so it is one kernel launch -- a naive Python shift-and-add over the
+    k taps would instead issue k separate memory-bound elementwise kernels that
+    dominate on GPU once the GEMMs shrink.
+
+    The kernel starts as a centred impulse (the last tap when causal) plus small
+    noise, so the module begins as a plain low-rank pointwise map. The output
+    keeps the input's (B, T) shape; when non-causal, kernel_size must be odd to
+    preserve T.
     """
  
     def __init__(
@@ -1299,7 +1292,7 @@ class SnowstormConv(nn.Module):
         self.k = kernel_size
         self.r = low_rank
         self.in_proj = nn.Linear(in_channels, low_rank, bias=bias)
-        # up-projection now maps r -> C (was r*k -> C)
+        # up-projection r -> C
         self.out_proj = nn.Linear(low_rank, out_channels, bias=bias)
         # depthwise temporal kernel in the latent space: one length-k filter
         # per low-rank channel. Initialised as a centred impulse (last tap when
@@ -1376,10 +1369,10 @@ class SnowLily(nn.Module):
     ):
         """Dynamic liquid (LTC) convolution layer.
 
-        SnowStormConv + Liquid Layer by time-enhanced dYnamical adaptation.
+        SnowstormConv + Liquid Layer by time-enhanced dYnamical adaptation.
         Dynamicises the coefficients of a Liquid Time-Constant (LTC) system so the
         per-token mixing adapts to the input — raising expressiveness — while
-        SnowStormConv supplies the efficient (GEMM-based) state operator. A
+        SnowstormConv supplies the efficient (separable low-rank) state operator. A
         bidirectional liquid convolution module inspired by LFM2.LFM2ConvBlock.
         ```
         Formulation:
@@ -1743,7 +1736,7 @@ MIXERS = {
     "swa": NexteraSlidingWindowAttention,
     "hra": NexteraHRA,
     "lily": SnowLily,
-    # Ablation-only local mixers (the paper's local-mixer ablation): drop-in replacements for "lily"
+    # Ablation-only local mixers (see ablations/): drop-in replacements for "lily"
     # that keep the block wiring and change only the local operator.
     "lfm2conv": LFM2Conv,
     "dsconv": DSConvMixer,
